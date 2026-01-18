@@ -1,4 +1,5 @@
 import streamlit as st
+import hmac
 from openai import OpenAI
 
 # --- PAGE CONFIGURATION ---
@@ -8,46 +9,80 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🤖 Multi-Model Chat: OpenAI & Grok")
-st.caption("A 3-way conversation between you, GPT-4o, and Grok.")
+# --- AUTHENTICATION LOGIC ---
+def check_password():
+    """Returns `True` if the user had the correct password."""
 
-# --- 1. SETUP & CREDENTIALS ---
-# We check if secrets are loaded. If running locally, this looks at .streamlit/secrets.toml
-# If running on Community Cloud, this looks at the App Settings -> Secrets area.
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't keep password in state
+        else:
+            st.session_state["password_correct"] = False
 
-if "OPENAI_API_KEY" not in st.secrets or "GROK_API_KEY" not in st.secrets:
-    st.error("API Keys are missing! Please set OPENAI_API_KEY and GROK_API_KEY in your Streamlit secrets.")
+    # Return True if the user has already validated
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # Show input if password hasn't been entered yet
+    st.title("🔒 Login Required")
+    st.text_input(
+        "Please enter the application password:", 
+        type="password", 
+        on_change=password_entered, 
+        key="password"
+    )
+    
+    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+        st.error("😕 Password incorrect")
+
+    return False
+
+# Stop execution if password is not correct
+if not check_password():
+    st.stop()
+
+# --- MAIN APP START (Only runs if authenticated) ---
+
+st.title("🤖 Multi-Model Chat")
+st.caption("Authenticated Session: You + GPT-4o + Grok")
+
+# --- 1. CREDENTIAL CHECK ---
+# Ensure all required keys exist in secrets
+required_secrets = ["OPENAI_API_KEY", "GROK_API_KEY", "APP_PASSWORD"]
+missing_secrets = [key for key in required_secrets if key not in st.secrets]
+
+if missing_secrets:
+    st.error(f"Missing secrets in configuration: {', '.join(missing_secrets)}")
     st.stop()
 
 # Initialize Clients
 openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Grok uses the OpenAI SDK but points to xAI's base URL
+# Grok (xAI) Client
 grok_client = OpenAI(
     api_key=st.secrets["GROK_API_KEY"], 
     base_url="https://api.x.ai/v1"
 )
 
-# --- 2. AGENT DEFINITIONS ---
+# --- 2. AGENT CLASS DEFINITION ---
 class Agent:
-    def __init__(self, name, client, model, system_prompt, avatar, color):
+    def __init__(self, name, client, model, system_prompt, avatar):
         self.name = name
         self.client = client
         self.model = model
         self.system_prompt = system_prompt
         self.avatar = avatar
-        self.color = color
 
     def generate_response(self, conversation_history):
-        # 1. Start with the agent's specific system instructions
+        # System prompt first
         messages = [{"role": "system", "content": self.system_prompt}]
         
-        # 2. Add the conversation history
-        # We format the history so the AI understands who said what
+        # Flatten history for the API
         for msg in conversation_history:
-            # We map "assistant" roles to generic inputs, but in the content
-            # we explicitly label who is speaking to avoid confusion.
             role = "user" if msg["role"] == "user" else "assistant"
+            # We explicitly put the Name in the content so the models know who is talking
             content = f"{msg['name']}: {msg['content']}"
             messages.append({"role": role, "content": content})
 
@@ -55,70 +90,63 @@ class Agent:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0.7 # Creativity level
+                temperature=0.7
             )
             return response.choices[0].message.content
         except Exception as e:
             return f"Error: {str(e)}"
 
-# Define our two agents
+# Define Agents
 agents = [
     Agent(
         name="GPT-4o",
         client=openai_client,
         model="gpt-4o", 
-        system_prompt="You are a helpful, logical, and polite AI assistant. You value structure and facts.",
-        avatar="🟢",
-        color="green"
+        system_prompt="You are a helpful, structured AI assistant. You answer questions concisely.",
+        avatar="🟢"
     ),
     Agent(
         name="Grok",
         client=grok_client,
-        model="grok-beta", # Ensure this model name matches current xAI availability
-        system_prompt="You are Grok. You have a rebellious, witty personality. You like to debate and offer alternative, sometimes edgy viewpoints compared to standard AI responses.",
-        avatar="⚫",
-        color="grey"
+        model="grok-beta", 
+        system_prompt="You are Grok. You are witty, rebellious, and enjoy debating. You often comment on the previous AI's response.",
+        avatar="⚫"
     )
 ]
 
-# --- 3. SESSION STATE (HISTORY) ---
+# --- 3. CHAT HISTORY STATE ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- 4. RENDER CHAT HISTORY ---
+# --- 4. RENDER UI ---
+# Render previous messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"], avatar=message.get("avatar")):
-        st.write(f"**{message['name']}**: {message['content']}")
+        st.markdown(f"**{message['name']}**: {message['content']}")
 
-# --- 5. CHAT LOGIC ---
-if user_input := st.chat_input("Say something to the group..."):
+# Input area
+if user_input := st.chat_input("Start the conversation..."):
     
-    # A. Append User Message
+    # 1. Add User Message
     st.session_state.messages.append({
         "role": "user",
         "name": "User",
         "content": user_input,
         "avatar": "👤"
     })
-    
-    # Display immediately
     with st.chat_message("user", avatar="👤"):
-        st.write(f"**User**: {user_input}")
+        st.markdown(f"**User**: {user_input}")
 
-    # B. Trigger Agents Sequence
-    # This loop ensures every agent gets a turn to speak based on the updated history
+    # 2. Iterate through Agents
     for agent in agents:
         with st.chat_message("assistant", avatar=agent.avatar):
             with st.spinner(f"{agent.name} is thinking..."):
-                
-                # Prepare history for the API (exclude system prompts of other agents)
-                # We simply pass the list of previous messages stored in session state
+                # Pass full history (User + Previous Agents) to current Agent
                 response_text = agent.generate_response(st.session_state.messages)
                 
-                # Display response
-                st.write(f"**{agent.name}**: {response_text}")
+                st.markdown(f"**{agent.name}**: {response_text}")
                 
-                # Add to history so the NEXT agent sees this response
+                # Append to history for next agent/loop
                 st.session_state.messages.append({
                     "role": "assistant",
                     "name": agent.name,
@@ -126,15 +154,11 @@ if user_input := st.chat_input("Say something to the group..."):
                     "avatar": agent.avatar
                 })
 
-# --- 6. SIDEBAR CONTROLS ---
+# --- 5. SIDEBAR ---
 with st.sidebar:
-    st.header("Settings")
-    if st.button("Reset Conversation"):
+    if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
-    
-    st.divider()
-    st.markdown("### How it works")
-    st.markdown("1. You send a message.")
-    st.markdown("2. **GPT-4o** responds to you.")
-    st.markdown("3. **Grok** responds to *both* you and GPT-4o.")
+    if st.button("Logout"):
+        st.session_state["password_correct"] = False
+        st.rerun()
