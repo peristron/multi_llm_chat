@@ -7,8 +7,6 @@ import google.generativeai as genai
 st.set_page_config(page_title="Multi-LLM Chat", page_icon="🤖", layout="wide")
 
 # DEFINE YOUR MODELS
-# You can define models here even if you don't have the keys yet.
-# The app will only check for the key when you actually select the model in the sidebar.
 AVAILABLE_MODELS = {
     "GPT-4o": {
         "api_id": "gpt-4o",
@@ -74,23 +72,29 @@ if not check_password():
 
 st.title("🤖 Multi-Model Arena")
 
-# --- 3. HELPER FUNCTIONS (LAZY LOADING) ---
+# --- 3. HELPER FUNCTIONS ---
 
-def get_client(model_conf):
+def get_client(model_conf, user_provided_key=None):
     """
     Tries to initialize a client. 
-    If the key is missing from secrets, it returns an error string 
-    instead of crashing the app.
+    Priority: 
+    1. User provided key (from Sidebar input)
+    2. Streamlit Secrets (server-side config)
     """
     key_name = model_conf["api_key_name"]
+    api_key = None
+
+    # Check for user key first, then secret
+    if user_provided_key:
+        api_key = user_provided_key
+    elif key_name in st.secrets:
+        api_key = st.secrets[key_name]
     
-    # 1. Check if the key exists in Streamlit Secrets
-    if key_name not in st.secrets:
-        return None, f"Missing Secret: {key_name}"
+    # If neither exists, return error
+    if not api_key:
+        return None, f"Missing Key: {key_name}"
 
-    api_key = st.secrets[key_name]
-
-    # 2. Configure Google
+    # Configure Google
     if model_conf["provider"] == "google":
         try:
             genai.configure(api_key=api_key)
@@ -98,7 +102,7 @@ def get_client(model_conf):
         except Exception as e:
             return None, f"Google Client Error: {str(e)}"
     
-    # 3. Configure OpenAI / Grok / DeepSeek
+    # Configure OpenAI / Grok / DeepSeek
     else:
         try:
             base_url = model_conf.get("base_url") 
@@ -125,7 +129,7 @@ if "total_tokens" not in st.session_state:
 
 # --- 5. AGENT CLASS ---
 class Agent:
-    def __init__(self, display_name, config):
+    def __init__(self, display_name, config, user_key=None):
         self.name = display_name
         self.config = config
         self.model_id = config["api_id"]
@@ -134,7 +138,8 @@ class Agent:
         self.avatar = config["icon"]
         
         # Initialize client immediately to check for errors
-        self.client, self.error = get_client(config)
+        # Pass the optional user_key to the helper function
+        self.client, self.error = get_client(config, user_key)
 
     def generate_response(self, conversation_history):
         # If client failed to load (e.g. missing key), return error as the message
@@ -188,13 +193,48 @@ class Agent:
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # Default is just OpenAI and Grok, so the user doesn't hit the Google error immediately
     selected_models = st.multiselect(
         "Select Participants:",
         options=list(AVAILABLE_MODELS.keys()),
         default=["GPT-4o", "Grok-3"] 
     )
+
+    # --- DYNAMIC KEY INPUT ---
+    # Container to store keys entered by the user
+    user_api_keys = {}
     
+    # Check if the selected models have keys in secrets. If not, ask user.
+    missing_secrets = []
+    for model_name in selected_models:
+        key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
+        if key_name not in st.secrets:
+            missing_secrets.append(model_name)
+
+    if missing_secrets:
+        st.divider()
+        st.caption("🔑 Enter API Keys")
+        st.info("Some selected models need API keys not found in system secrets.")
+        
+        for model_name in missing_secrets:
+            key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
+            user_input = st.text_input(
+                f"{model_name} Key", 
+                type="password",
+                help=f"Enter {key_name} for {model_name}"
+            )
+            if user_input:
+                user_api_keys[model_name] = user_input
+    
+    # --- HELPER TEXT ---
+    with st.expander("ℹ️ Where do I get keys?"):
+        st.markdown("""
+        If you don't have keys, sign up here:
+        *   **OpenAI:** [platform.openai.com](https://platform.openai.com/api-keys)
+        *   **Google:** [aistudio.google.com](https://aistudio.google.com/app/apikey)
+        *   **DeepSeek:** [platform.deepseek.com](https://platform.deepseek.com)
+        *   **xAI (Grok):** [console.x.ai](https://console.x.ai)
+        """)
+
     st.divider()
     st.header("📊 Session Stats")
     st.metric("Est. Cost", f"${st.session_state.session_cost:.5f}")
@@ -216,7 +256,10 @@ with st.sidebar:
 # Instantiate active agents
 active_agents = []
 for name in selected_models:
-    active_agents.append(Agent(name, AVAILABLE_MODELS[name]))
+    # Get user key if it exists in the dictionary, otherwise None
+    user_key = user_api_keys.get(name)
+    # Pass the user_key to the Agent (which will prioritize it over secrets)
+    active_agents.append(Agent(name, AVAILABLE_MODELS[name], user_key))
 
 # Render History
 for message in st.session_state.messages:
