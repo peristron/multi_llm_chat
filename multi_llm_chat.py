@@ -286,7 +286,7 @@ with st.sidebar:
     # --- HELPER TEXT ---
     with st.expander("ℹ️ Where do I get keys?"):
         st.markdown("""
-        If you don't have keys, sign up here:
+        If you don't have keys, sign up here (just some popular examples, but there are dozens out there):
         *   **OpenAI:** [platform.openai.com](https://platform.openai.com/api-keys)
         *   **Google:** [aistudio.google.com](https://aistudio.google.com/app/apikey)
         *   **DeepSeek:** [platform.deepseek.com](https://platform.deepseek.com)
