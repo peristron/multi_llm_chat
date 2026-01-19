@@ -323,7 +323,7 @@ if user_input := st.chat_input("Start the conversation... (Tip: use @mention to 
         st.error("Please select at least one AI model.")
         st.stop()
 
-    # User Message
+    # User
     st.session_state.messages.append({"role": "user", "name": "User", "content": user_input, "avatar": "👤"})
     with st.chat_message("user", avatar="👤"):
         st.markdown(f"**User**: {user_input}")
@@ -332,16 +332,23 @@ if user_input := st.chat_input("Start the conversation... (Tip: use @mention to 
     # 1. Default to all active agents
     responders = active_agents
     
-    # 2. Check if specific agents were mentioned (e.g. "@DeepSeek", "@GPT")
+    # 2. Check if specific agents were mentioned
     mentioned_agents = []
     lower_input = user_input.lower()
     
     for agent in active_agents:
-        # Check for "@AgentName" or "@FirstName" (e.g. @Gemini for Gemini 1.5 Pro)
-        full_mention = f"@{agent.name}".lower().replace(" ", "") # @gemini1.5pro
-        first_word_mention = f"@{agent.name.split()[0]}".lower() # @gemini
+        # Create a list of valid triggers for this agent
+        name_lower = agent.name.lower()
         
-        if full_mention in lower_input.replace(" ", "") or first_word_mention in lower_input:
+        triggers = [
+            f"@{name_lower}",                 # Full name: "@grok-3", "@gpt-4o"
+            f"@{name_lower.replace(' ', '')}",# Compressed: "@gemini1.5pro"
+            f"@{name_lower.split()[0]}",      # First word (Space split): "@gemini", "@deepseek"
+            f"@{name_lower.split('-')[0]}"    # First word (Hyphen split): "@grok", "@gpt"
+        ]
+        
+        # Check if ANY of the triggers exist in the user input
+        if any(trigger in lower_input for trigger in triggers):
             mentioned_agents.append(agent)
             
     # 3. If mentions were found, override the responder list
