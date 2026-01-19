@@ -288,7 +288,7 @@ with st.sidebar:
     
     st.metric("Est. Cost", f"${st.session_state.session_cost:.5f}")
     # note on aggregation of cost value
-    st.caption("Aggregated total across all models used in the chat. Estimates use standard pricing (may overestimate if using free/fallback models).")
+    st.caption("Aggregated total across all models used in the chat session. Estimates use standard pricing (may overestimate if using free/fallback models).")
     
     st.metric("Total Tokens", f"{st.session_state.total_tokens:,}")
     
