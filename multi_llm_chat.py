@@ -323,13 +323,33 @@ if user_input := st.chat_input("Start the conversation..."):
         st.error("Please select at least one AI model.")
         st.stop()
 
-    # User
+    # User Message
     st.session_state.messages.append({"role": "user", "name": "User", "content": user_input, "avatar": "👤"})
     with st.chat_message("user", avatar="👤"):
         st.markdown(f"**User**: {user_input}")
 
-    # AI Response Loop
+    # --- MENTION LOGIC ---
+    # 1. Default to all active agents
+    responders = active_agents
+    
+    # 2. Check if specific agents were mentioned (e.g. "@DeepSeek", "@GPT")
+    mentioned_agents = []
+    lower_input = user_input.lower()
+    
     for agent in active_agents:
+        # Check for "@AgentName" or "@FirstName" (e.g. @Gemini for Gemini 1.5 Pro)
+        full_mention = f"@{agent.name}".lower().replace(" ", "") # @gemini1.5pro
+        first_word_mention = f"@{agent.name.split()[0]}".lower() # @gemini
+        
+        if full_mention in lower_input.replace(" ", "") or first_word_mention in lower_input:
+            mentioned_agents.append(agent)
+            
+    # 3. If mentions were found, override the responder list
+    if mentioned_agents:
+        responders = mentioned_agents
+
+    # AI Response Loop
+    for agent in responders:
         with st.chat_message("assistant", avatar=agent.avatar):
             with st.spinner(f"{agent.name} is thinking..."):
                 
