@@ -285,7 +285,11 @@ with st.sidebar:
 
     st.divider()
     st.header("📊 Session Stats")
+    
     st.metric("Est. Cost", f"${st.session_state.session_cost:.5f}")
+    # note on aggregation of cost value
+    st.caption("Aggregated total. Estimates use standard pricing (may overestimate if using free/fallback models).")
+    
     st.metric("Total Tokens", f"{st.session_state.total_tokens:,}")
     
     st.divider()
