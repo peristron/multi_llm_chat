@@ -72,7 +72,17 @@ def check_password():
 if not check_password():
     st.stop()
 
+
 st.title("🤖 Multi-Model Arena")
+
+# --- APP INSTRUCTIONS ---
+with st.expander("📚 How to use this app"):
+    st.markdown("""
+    *   **Select Participants:** Choose which AI models to chat with in the Sidebar.
+    *   **Directed Chat:** By default, all selected models respond. Type **`@grok`**, **`@gpt`**, or **`@deepseek`** to target specific models.
+    *   **Persistent Memory:** The conversation history is sent with every message. Instructions like *"be concise"* or *"answer in JSON"* will be remembered for the whole session.
+    *   **Smart Fallback:** If a specific Google model (e.g. Pro) is unavailable, the app automatically switches to the best available alternative (e.g. Flash).
+    """)
 
 # --- 3. HELPER FUNCTIONS ---
 
