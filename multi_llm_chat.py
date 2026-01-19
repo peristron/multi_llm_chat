@@ -284,7 +284,7 @@ with st.sidebar:
         """)
 
     st.divider()
-    st.header("📊 Session Stats")
+    st.header("📊 Session Stats/Cost Calculator")
     
     st.metric("Est. Cost", f"${st.session_state.session_cost:.5f}")
     # note on aggregation of cost value
