@@ -254,7 +254,7 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     selected_models = st.multiselect(
-        "Select Participants:",
+        "Select Participants (add as needed):",
         options=list(AVAILABLE_MODELS.keys()),
         default=["GPT-4o", "Grok-3"] 
     )
