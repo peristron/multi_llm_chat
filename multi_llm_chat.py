@@ -317,7 +317,7 @@ for message in st.session_state.messages:
         st.markdown(f"**{message['name']}**: {message['content']}")
 
 # Input
-if user_input := st.chat_input("Start the conversation..."):
+if user_input := st.chat_input("Start the conversation... (Tip: use @mention to target specific models like '@deepseek')"):
     
     if not active_agents:
         st.error("Please select at least one AI model.")
