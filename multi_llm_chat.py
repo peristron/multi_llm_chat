@@ -7,6 +7,8 @@ import google.generativeai as genai
 st.set_page_config(page_title="Multi-LLM Chat", page_icon="🤖", layout="wide")
 
 # DEFINE YOUR MODELS
+# Note: For Google, we define a 'preferred' ID, but the code is now smart enough
+# to switch to a valid model if the preferred one is not found (404).
 AVAILABLE_MODELS = {
     "GPT-4o": {
         "api_id": "gpt-4o",
@@ -29,7 +31,7 @@ AVAILABLE_MODELS = {
         "system_prompt": "You are Grok 3. You are witty, rebellious, and enjoy debating."
     },
     "Gemini 1.5 Pro": {
-        "api_id": "gemini-1.5-pro",
+        "api_id": "gemini-1.5-pro", 
         "provider": "google",
         "api_key_name": "GOOGLE_API_KEY",
         "price_input": 1.25,
@@ -138,7 +140,6 @@ class Agent:
         self.avatar = config["icon"]
         
         # Initialize client immediately to check for errors
-        # Pass the optional user_key to the helper function
         self.client, self.error = get_client(config, user_key)
 
     def generate_response(self, conversation_history):
@@ -170,23 +171,72 @@ class Agent:
             return f"API Error: {str(e)}", 0, 0
 
     def _call_google(self, history):
-        try:
+        """
+        Executes Google call with Smart Fallback.
+        If the configured model is not found, it asks the API for available models
+        and switches to the best one available.
+        """
+        def execute_gemini(model_name, chat_history):
             model = genai.GenerativeModel(
-                self.model_id,
+                model_name,
                 system_instruction=self.system_prompt
             )
             google_history = []
-            for msg in history:
+            for msg in chat_history:
                 role = "user" if msg["role"] == "user" else "model"
                 google_history.append({"role": role, "parts": [f"{msg['name']}: {msg['content']}"]})
 
             response = model.generate_content(google_history)
             if not response.text:
-                return "Error: Empty response.", 0, 0
-                
+                raise ValueError("Empty response from Google.")
+            
             usage = response.usage_metadata
             return response.text, usage.prompt_token_count, usage.candidates_token_count
+
+        # 1. Try the configured model (e.g., gemini-1.5-pro)
+        try:
+            return execute_gemini(self.model_id, history)
         except Exception as e:
+            # 2. Check if error is 'Not Found' (404) or similar client error
+            error_str = str(e).lower()
+            if "404" in error_str or "not found" in error_str:
+                try:
+                    # 3. Dynamic Discovery: Ask Google what models we DO have
+                    available_models = [
+                        m.name for m in genai.list_models() 
+                        if 'generateContent' in m.supported_generation_methods
+                    ]
+                    
+                    # 4. Priority Logic: Try to find the best available substitute
+                    # Priority: 1.5 Pro -> 1.5 Flash -> 1.0 Pro
+                    fallback_model = None
+                    
+                    # Clean up names (remove 'models/' prefix for matching)
+                    clean_available = [m.replace("models/", "") for m in available_models]
+
+                    if "gemini-1.5-pro" in clean_available:
+                        fallback_model = "gemini-1.5-pro"
+                    elif "gemini-1.5-flash" in clean_available:
+                        fallback_model = "gemini-1.5-flash"
+                    elif "gemini-pro" in clean_available:
+                        fallback_model = "gemini-pro"
+                    elif len(available_models) > 0:
+                        # If none of our favorites exist, pick the first valid one
+                        fallback_model = available_models[0].replace("models/", "")
+
+                    if fallback_model:
+                        # Retry with the fallback
+                        text, in_tok, out_tok = execute_gemini(fallback_model, history)
+                        # Append a small note so the user knows
+                        text += f"\n\n*(Note: {self.model_id} was unavailable. Auto-switched to {fallback_model})*"
+                        return text, in_tok, out_tok
+                    else:
+                        return f"Google Error: Model not found and no valid fallbacks available.", 0, 0
+
+                except Exception as fallback_error:
+                    return f"Google Error: {str(e)} | Fallback failed: {str(fallback_error)}", 0, 0
+            
+            # If it wasn't a 404 error, just return the original error
             return f"Google Error: {str(e)}", 0, 0
 
 # --- 6. SIDEBAR ---
@@ -200,10 +250,8 @@ with st.sidebar:
     )
 
     # --- DYNAMIC KEY INPUT ---
-    # Container to store keys entered by the user
     user_api_keys = {}
     
-    # Check if the selected models have keys in secrets. If not, ask user.
     missing_secrets = []
     for model_name in selected_models:
         key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
@@ -256,9 +304,7 @@ with st.sidebar:
 # Instantiate active agents
 active_agents = []
 for name in selected_models:
-    # Get user key if it exists in the dictionary, otherwise None
     user_key = user_api_keys.get(name)
-    # Pass the user_key to the Agent (which will prioritize it over secrets)
     active_agents.append(Agent(name, AVAILABLE_MODELS[name], user_key))
 
 # Render History
