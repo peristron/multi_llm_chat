@@ -223,14 +223,21 @@ class Agent:
                 role = "user" if msg["role"] == "user" else "model"
                 google_history.append({"role": role, "parts": [f"{msg['name']}: {msg['content']}"]})
 
-            # add stop sequences for gemini (really, for gemini flash model)
+            # 
+            # ONLY stop on "User:". 
+            # DO NOT stop on self.name (e.g. "Gemini:") because if the model 
+            # starts with its own name, the API cuts it off at token 0 and crashes
             gen_config = genai.types.GenerationConfig(
-                stop_sequences=["User:", f"{self.name}:"]
+                stop_sequences=["User:", "User", "\nUser"]
             )
 
             response = model.generate_content(google_history, generation_config=gen_config)
-            if not response.text:
-                raise ValueError("Empty response from Google.")
+            
+            # checks for valid text parts
+            if not response.candidates or not response.candidates[0].content.parts:
+                # if the model blocked itself or returned empty, return a fallback message
+                # prevents the app from crashing on safety/empty blocks
+                return "...", 0, 0
             
             usage = response.usage_metadata
             return response.text, usage.prompt_token_count, usage.candidates_token_count
