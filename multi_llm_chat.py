@@ -141,13 +141,22 @@ if "total_tokens" not in st.session_state:
 
 # --- 5. AGENT CLASS ---
 class Agent:
-    def __init__(self, display_name, config, user_key=None):
+    def __init__(self, display_name, config, user_key=None, concise_mode=True):
         self.name = display_name
         self.config = config
         self.model_id = config["api_id"]
         self.provider = config["provider"]
-        self.system_prompt = config["system_prompt"]
         self.avatar = config["icon"]
+        
+        # --- SYSTEM PROMPT LOGIC ---
+        # Start with the model's base personality
+        base_prompt = config["system_prompt"]
+        
+        # If concise mode is enabled, append the instruction
+        if concise_mode:
+            base_prompt += " Your default behavior is to be brief, concise, and direct. Only provide long or detailed explanations if the user explicitly asks for them."
+            
+        self.system_prompt = base_prompt
         
         # Initialize client immediately to check for errors
         self.client, self.error = get_client(config, user_key)
@@ -259,6 +268,14 @@ with st.sidebar:
         default=["GPT-4o", "Grok-3"] 
     )
 
+    st.caption("Settings")
+    # --- CONCISE MODE TOGGLE ---
+    concise_mode = st.checkbox(
+        "Concise Responses", 
+        value=True, 
+        help="If checked, instructs all models to keep answers brief and direct unless asked otherwise."
+    )
+
     # --- DYNAMIC KEY INPUT ---
     user_api_keys = {}
     
@@ -319,7 +336,8 @@ with st.sidebar:
 active_agents = []
 for name in selected_models:
     user_key = user_api_keys.get(name)
-    active_agents.append(Agent(name, AVAILABLE_MODELS[name], user_key))
+    # Pass the concise_mode boolean to the agent
+    active_agents.append(Agent(name, AVAILABLE_MODELS[name], user_key, concise_mode))
 
 # Render History
 for message in st.session_state.messages:
