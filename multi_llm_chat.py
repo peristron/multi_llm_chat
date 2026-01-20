@@ -223,24 +223,39 @@ class Agent:
                 role = "user" if msg["role"] == "user" else "model"
                 google_history.append({"role": role, "parts": [f"{msg['name']}: {msg['content']}"]})
 
-            # 
-            # ONLY stop on "User:". 
-            # DO NOT stop on self.name (e.g. "Gemini:") because if the model 
-            # starts with its own name, the API cuts it off at token 0 and crashes
+            # 1. removed stop sequences (handle in python to prevent empty returns)
+            # 2. added safety settings (prevents silent blocking)
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+            
             gen_config = genai.types.GenerationConfig(
-                stop_sequences=["User:", "User", "\nUser"]
+                candidate_count=1
             )
 
-            response = model.generate_content(google_history, generation_config=gen_config)
+            response = model.generate_content(
+                google_history, 
+                generation_config=gen_config,
+                safety_settings=safety_settings
+            )
             
-            # checks for valid text parts
-            if not response.candidates or not response.candidates[0].content.parts:
-                # if the model blocked itself or returned empty, return a fallback message
-                # prevents the app from crashing on safety/empty blocks
+            # handles cases where text is missing/blocked
+            try:
+                text = response.text
+            except ValueError:
+                # for if safety filters blocked it or it's empty
                 return "...", 0, 0
+
+            # manual stop sequence logic (python side)
+            # if the model hallucinates "User:", cut it off there
+            if "User:" in text:
+                text = text.split("User:")[0]
             
             usage = response.usage_metadata
-            return response.text, usage.prompt_token_count, usage.candidates_token_count
+            return text, usage.prompt_token_count, usage.candidates_token_count
 
         try:
             return execute_gemini(self.model_id, history)
@@ -259,6 +274,10 @@ class Agent:
 
                     if fallback_model:
                         text, in_tok, out_tok = execute_gemini(fallback_model, history)
+                        # ensures no return of nn empty string + note
+                        if not text.strip() or text == "...":
+                            text = "I am here." # fallback text if model stays silent
+                        
                         text += f"\n\n*(Note: {self.model_id} was unavailable. Auto-switched to {fallback_model})*"
                         return text, in_tok, out_tok
                     else:
@@ -266,7 +285,7 @@ class Agent:
                 except Exception as fallback_error:
                     return f"Google Error: {str(e)} | Fallback failed: {str(fallback_error)}", 0, 0
             return f"Google Error: {str(e)}", 0, 0
-
+            
 # --- 6. sidebar-
 with st.sidebar:
     st.header("⚙️ Configuration")
