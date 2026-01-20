@@ -4,10 +4,10 @@ import re  # added for string cleaning
 from openai import OpenAI
 import google.generativeai as genai
 
-# --- 1. CONFIGURATION ---
+# --- 1. configuration
 st.set_page_config(page_title="Multi-LLM Chat", page_icon="🤖", layout="wide")
 
-# defining the models
+# deining the models
 AVAILABLE_MODELS = {
     "GPT-4o": {
         "api_id": "gpt-4o",
@@ -29,14 +29,14 @@ AVAILABLE_MODELS = {
         "icon": "⚫",
         "system_prompt": "You are Grok 3. You are witty, rebellious, and enjoy debating."
     },
-    "Gemini 1.5 Pro": {
-        "api_id": "gemini-1.5-pro", 
+    "Gemini 1.5 Flash": {  # gemini Pro to Flash
+        "api_id": "gemini-1.5-flash", # updated id
         "provider": "google",
         "api_key_name": "GOOGLE_API_KEY",
-        "price_input": 1.25,
-        "price_output": 5.00,
+        "price_input": 0.075, # price updated (flash is ~15x cheaper)
+        "price_output": 0.30,
         "icon": "🔵",
-        "system_prompt": "You are Gemini 1.5 Pro. You are detailed and nuanced."
+        "system_prompt": "You are Gemini 1.5 Flash. You are fast, efficient, and detailed."
     },
     "DeepSeek V3": {
         "api_id": "deepseek-chat",
