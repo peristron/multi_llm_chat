@@ -1,14 +1,13 @@
 import streamlit as st
 import hmac
+import re  # added for string cleaning
 from openai import OpenAI
 import google.generativeai as genai
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Multi-LLM Chat", page_icon="🤖", layout="wide")
 
-# DEFINE YOUR MODELS
-# Note: For Google, we define a 'preferred' ID, but the code is now smart enough
-# to switch to a valid model if the preferred one is not found (404).
+# defining the models
 AVAILABLE_MODELS = {
     "GPT-4o": {
         "api_id": "gpt-4o",
@@ -51,7 +50,7 @@ AVAILABLE_MODELS = {
     }
 }
 
-# --- 2. AUTHENTICATION ---
+# --- 2. auth
 def check_password():
     def password_entered():
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
@@ -75,7 +74,7 @@ if not check_password():
 
 st.title("🤖 Multi-Model Arena")
 
-# --- APP INSTRUCTIONS ---
+# --- app instructions-
 with st.expander("📚 How to use this app"):
     st.markdown("""
     *   **Select Participants:** Choose which AI models to chat with in the Sidebar.
@@ -84,7 +83,7 @@ with st.expander("📚 How to use this app"):
     *   **Smart Fallback:** If a specific Google model (e.g. Pro) is unavailable, the app automatically switches to the best available alternative (e.g. Flash).
     """)
 
-# --- 3. HELPER FUNCTIONS ---
+# --- 3. helper functions
 
 def get_client(model_conf, user_provided_key=None):
     """
@@ -114,7 +113,7 @@ def get_client(model_conf, user_provided_key=None):
         except Exception as e:
             return None, f"Google Client Error: {str(e)}"
     
-    # Configure OpenAI / Grok / DeepSeek
+    # configuring openAI / grok / deepSeek
     else:
         try:
             base_url = model_conf.get("base_url") 
@@ -148,28 +147,42 @@ class Agent:
         self.provider = config["provider"]
         self.avatar = config["icon"]
         
-        # --- SYSTEM PROMPT LOGIC ---
-        # Start with the model's base personality
+        # --- system prompt logic
         base_prompt = config["system_prompt"]
-        
-        # If concise mode is enabled, append the instruction
         if concise_mode:
             base_prompt += " Your default behavior is to be brief, concise, and direct. Only provide long or detailed explanations if the user explicitly asks for them."
             
         self.system_prompt = base_prompt
         
-        # Initialize client immediately to check for errors
+        # initializes client immediately to check for errors
         self.client, self.error = get_client(config, user_key)
 
+    def _clean_response(self, text):
+        """
+        Removes the model's own name from the start of the response.
+        Example: "GPT-4o: Hello" -> "Hello"
+        """
+        if not text:
+            return ""
+            
+        # Rregex to match "Name:" or "Name " or "Name-" at start of string, case insensitive
+        #escape the name to handle dots/spaces in model names
+        pattern = r"^" + re.escape(self.name) + r"[:\-\s]+"
+        cleaned_text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+        return cleaned_text
+
     def generate_response(self, conversation_history):
-        # If client failed to load (e.g. missing key), return error as the message
+        # if client failed to load (e.g. missing key), return error as the message
         if self.error:
             return f"⚠️ {self.error}", 0, 0
 
         if self.provider == "google":
-            return self._call_google(conversation_history)
+            content, in_tok, out_tok = self._call_google(conversation_history)
         else:
-            return self._call_openai_compatible(conversation_history)
+            content, in_tok, out_tok = self._call_openai_compatible(conversation_history)
+            
+        # cleans the "Name Echo" before returning
+        return self._clean_response(content), in_tok, out_tok
 
     def _call_openai_compatible(self, history):
         messages = [{"role": "system", "content": self.system_prompt}]
@@ -179,10 +192,20 @@ class Agent:
             messages.append({"role": role, "content": content})
 
         try:
+            # STOP SEQUENCES: prevent deepSeek/grok from roleplaying other bots
+            stop_sequences = ["User:", "User", "\nUser"]
+            for model_name in AVAILABLE_MODELS.keys():
+                stop_sequences.append(f"{model_name}:")
+                stop_sequences.append(f"\n{model_name}:")
+
             response = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=messages,
-                temperature=0.7
+                temperature=0.7,
+                stop=stop_sequences[:4] # openAI limits stop sequences (usually 4)
+                # note: DeepSeek usually supports more, but sticking to 4 key ones or just "User:" 
+                # is often enough if the system prompt is strong
+                # tries just catching the most likely ones to break the loop
             )
             content = response.choices[0].message.content
             return content, response.usage.prompt_tokens, response.usage.completion_tokens
@@ -190,11 +213,6 @@ class Agent:
             return f"API Error: {str(e)}", 0, 0
 
     def _call_google(self, history):
-        """
-        Executes Google call with Smart Fallback.
-        If the configured model is not found, it asks the API for available models
-        and switches to the best one available.
-        """
         def execute_gemini(model_name, chat_history):
             model = genai.GenerativeModel(
                 model_name,
@@ -205,60 +223,44 @@ class Agent:
                 role = "user" if msg["role"] == "user" else "model"
                 google_history.append({"role": role, "parts": [f"{msg['name']}: {msg['content']}"]})
 
-            response = model.generate_content(google_history)
+            # add stop sequences for gemini (really, for gemini flash model)
+            gen_config = genai.types.GenerationConfig(
+                stop_sequences=["User:", f"{self.name}:"]
+            )
+
+            response = model.generate_content(google_history, generation_config=gen_config)
             if not response.text:
                 raise ValueError("Empty response from Google.")
             
             usage = response.usage_metadata
             return response.text, usage.prompt_token_count, usage.candidates_token_count
 
-        # 1. Try the configured model (e.g., gemini-1.5-pro)
         try:
             return execute_gemini(self.model_id, history)
         except Exception as e:
-            # 2. Check if error is 'Not Found' (404) or similar client error
             error_str = str(e).lower()
             if "404" in error_str or "not found" in error_str:
                 try:
-                    # 3. Dynamic Discovery: Ask Google what models we DO have
-                    available_models = [
-                        m.name for m in genai.list_models() 
-                        if 'generateContent' in m.supported_generation_methods
-                    ]
-                    
-                    # 4. Priority Logic: Try to find the best available substitute
-                    # Priority: 1.5 Pro -> 1.5 Flash -> 1.0 Pro
-                    fallback_model = None
-                    
-                    # Clean up names (remove 'models/' prefix for matching)
+                    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
                     clean_available = [m.replace("models/", "") for m in available_models]
 
-                    if "gemini-1.5-pro" in clean_available:
-                        fallback_model = "gemini-1.5-pro"
-                    elif "gemini-1.5-flash" in clean_available:
-                        fallback_model = "gemini-1.5-flash"
-                    elif "gemini-pro" in clean_available:
-                        fallback_model = "gemini-pro"
-                    elif len(available_models) > 0:
-                        # If none of our favorites exist, pick the first valid one
-                        fallback_model = available_models[0].replace("models/", "")
+                    fallback_model = None
+                    if "gemini-1.5-pro" in clean_available: fallback_model = "gemini-1.5-pro"
+                    elif "gemini-1.5-flash" in clean_available: fallback_model = "gemini-1.5-flash"
+                    elif "gemini-pro" in clean_available: fallback_model = "gemini-pro"
+                    elif len(available_models) > 0: fallback_model = available_models[0].replace("models/", "")
 
                     if fallback_model:
-                        # Retry with the fallback
                         text, in_tok, out_tok = execute_gemini(fallback_model, history)
-                        # Append a small note so the user knows
                         text += f"\n\n*(Note: {self.model_id} was unavailable. Auto-switched to {fallback_model})*"
                         return text, in_tok, out_tok
                     else:
                         return f"Google Error: Model not found and no valid fallbacks available.", 0, 0
-
                 except Exception as fallback_error:
                     return f"Google Error: {str(e)} | Fallback failed: {str(fallback_error)}", 0, 0
-            
-            # If it wasn't a 404 error, just return the original error
             return f"Google Error: {str(e)}", 0, 0
 
-# --- 6. SIDEBAR ---
+# --- 6. sidebar-
 with st.sidebar:
     st.header("⚙️ Configuration")
     
@@ -269,16 +271,14 @@ with st.sidebar:
     )
 
     st.caption("Settings")
-    # --- CONCISE MODE TOGGLE ---
     concise_mode = st.checkbox(
         "Concise Responses", 
         value=True, 
         help="If checked, instructs all models to keep answers brief and direct unless asked otherwise."
     )
 
-    # --- DYNAMIC KEY INPUT ---
+    # --- dynamic key entry
     user_api_keys = {}
-    
     missing_secrets = []
     for model_name in selected_models:
         key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
@@ -289,21 +289,16 @@ with st.sidebar:
         st.divider()
         st.caption("🔑 Enter API Keys")
         st.info("Some selected models need API keys not found in system secrets.")
-        
         for model_name in missing_secrets:
             key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
-            user_input = st.text_input(
-                f"{model_name} Key", 
-                type="password",
-                help=f"Enter {key_name} for {model_name}"
-            )
+            user_input = st.text_input(f"{model_name} Key", type="password")
             if user_input:
                 user_api_keys[model_name] = user_input
     
-    # --- HELPER TEXT ---
+    # --helper text
     with st.expander("ℹ️ Where do I get keys?"):
         st.markdown("""
-        If you don't have keys, sign up here (just some popular examples, but there are dozens out there):
+        If you don't have keys, sign up here (just some popular examples):
         *   **OpenAI:** [platform.openai.com](https://platform.openai.com/api-keys)
         *   **Google:** [aistudio.google.com](https://aistudio.google.com/app/apikey)
         *   **DeepSeek:** [platform.deepseek.com](https://platform.deepseek.com)
@@ -312,11 +307,8 @@ with st.sidebar:
 
     st.divider()
     st.header("📊 Session Stats/Cost Calculator")
-    
     st.metric("Est. Cost", f"${st.session_state.session_cost:.5f}")
-    # note on aggregation of cost value
-    st.caption("Aggregated total across all models used in the chat session. Estimates use standard pricing (may overestimate if using free/fallback models).")
-    
+    st.caption("Aggregated total across all models used in the chat session. Estimates use standard pricing.")
     st.metric("Total Tokens", f"{st.session_state.total_tokens:,}")
     
     st.divider()
@@ -330,75 +322,55 @@ with st.sidebar:
         st.session_state["password_correct"] = False
         st.rerun()
 
-# --- 7. MAIN APP LOOP ---
+# --- 7. main app loop
 
-# Instantiate active agents
+# instantiating active agents
 active_agents = []
 for name in selected_models:
     user_key = user_api_keys.get(name)
-    # Pass the concise_mode boolean to the agent
     active_agents.append(Agent(name, AVAILABLE_MODELS[name], user_key, concise_mode))
 
-# Render History
+# render history
 for message in st.session_state.messages:
     with st.chat_message(message["role"], avatar=message.get("avatar")):
         st.markdown(f"**{message['name']}**: {message['content']}")
 
-# Input
+# input
 if user_input := st.chat_input("Start the conversation... (Tip: use @mention to target specific models like '@deepseek')"):
     
     if not active_agents:
         st.error("Please select at least one AI model.")
         st.stop()
 
-    # User
+    # user
     st.session_state.messages.append({"role": "user", "name": "User", "content": user_input, "avatar": "👤"})
     with st.chat_message("user", avatar="👤"):
         st.markdown(f"**User**: {user_input}")
 
-    # --- MENTION LOGIC ---
-    # 1. Default to all active agents
+    # --mention logic
     responders = active_agents
-    
-    # 2. Check if specific agents were mentioned
     mentioned_agents = []
     lower_input = user_input.lower()
-    
     for agent in active_agents:
-        # Create a list of valid triggers for this agent
         name_lower = agent.name.lower()
-        
-        triggers = [
-            f"@{name_lower}",                 # Full name: "@grok-3", "@gpt-4o"
-            f"@{name_lower.replace(' ', '')}",# Compressed: "@gemini1.5pro"
-            f"@{name_lower.split()[0]}",      # First word (Space split): "@gemini", "@deepseek"
-            f"@{name_lower.split('-')[0]}"    # First word (Hyphen split): "@grok", "@gpt"
-        ]
-        
-        # Check if ANY of the triggers exist in the user input
+        triggers = [f"@{name_lower}", f"@{name_lower.replace(' ', '')}", f"@{name_lower.split()[0]}", f"@{name_lower.split('-')[0]}"]
         if any(trigger in lower_input for trigger in triggers):
             mentioned_agents.append(agent)
-            
-    # 3. If mentions were found, override the responder list
     if mentioned_agents:
         responders = mentioned_agents
 
-    # AI Response Loop
+    # ai response loop
     for agent in responders:
         with st.chat_message("assistant", avatar=agent.avatar):
             with st.spinner(f"{agent.name} is thinking..."):
-                
                 content, in_tok, out_tok = agent.generate_response(st.session_state.messages)
-                
                 st.markdown(f"**{agent.name}**: {content}")
-                
                 st.session_state.messages.append({
-                    "role": "assistant",
-                    "name": agent.name,
-                    "content": content,
+                    "role": "assistant", 
+                    "name": agent.name, 
+                    "content": content, 
                     "avatar": agent.avatar
                 })
-                
                 cost = calculate_cost(agent.name, in_tok, out_tok)
                 st.session_state.session_cost += cost
                 st.session_state.total_tokens += (in_tok + out_tok)
