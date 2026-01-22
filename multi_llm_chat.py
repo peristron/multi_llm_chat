@@ -1,6 +1,6 @@
 import streamlit as st
 import hmac
-import re  # Used for cleaning responses
+import re  # Regex is the hero we need for Gemini
 from openai import OpenAI
 import google.generativeai as genai
 
@@ -150,8 +150,8 @@ class Agent:
         # --- SYSTEM PROMPT LOGIC ---
         base_prompt = config["system_prompt"]
         if concise_mode:
-            # UPDATED PROMPT: Explicitly forbid speaking for others to fix Gemini hallucination
-            base_prompt += " Your default behavior is to be brief, concise, and direct. Do not speak for other models. Only provide long explanations if asked."
+            # We add a stern instruction to be itself
+            base_prompt += " Your default behavior is to be brief, concise, and direct. Do not speak for other models. You are NOT Claude or OpenAI. Only provide long explanations if asked."
             
         self.system_prompt = base_prompt
         
@@ -160,33 +160,47 @@ class Agent:
 
     def _clean_response(self, text):
         """
-        1. Removes the model's own name from the start.
-        2. Chops off text if the model tries to speak for someone else.
-        3. Handles empty responses (e.g. if model only outputted its name).
+        Uses Regex to aggressively strip 'Name:' headers, handling cases like
+        'Claude 3.5 Sonnet:' which simple string matching misses.
         """
         if not text:
-            return ""
+            return "Present."
         
-        # A. Remove Self-Echo at start
-        pattern = r"^" + re.escape(self.name) + r"[:\-\s]+"
-        cleaned_text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+        # 1. Remove Own Name (Standard)
+        # e.g. "Gemini 2.5 Flash: Hello" -> "Hello"
+        pattern_own = r"^" + re.escape(self.name) + r"[:\-\s]+"
+        cleaned_text = re.sub(pattern_own, "", text, flags=re.IGNORECASE).strip()
 
-        # FIX: If cleaning removed EVERYTHING (e.g. model just said "GPT-4o"), 
-        # return a default acknowledgement so we don't show an empty bubble.
+        # 2. Identity Crisis & Hallucination Filter
+        # Define a list of "Base Names" to catch. 
+        # This will catch "Claude", "Claude 3", "Claude 3.5 Sonnet", etc.
+        base_names = ["User", "Claude", "Dall-E", "Bard", "Bing", "GPT", "Grok", "DeepSeek", "Llama", "Mistral"]
+        
+        # Regex Explanation:
+        # ^ or \n : Start of string OR new line
+        # ( ... ) : Match one of the base names
+        # [^:\n]* : Match any extra characters (like version numbers) that are NOT a colon or newline
+        # :       : The actual colon
+        # \s*     : Optional whitespace
+        
+        # A. Identity Theft at the START of the message
+        # If text starts with "Claude 3.5 Sonnet: Greetings", we strip the header
+        # and keep "Greetings". This forces the model to own the text it generated.
+        pattern_identity_start = r"^(" + "|".join(base_names) + r")[^:\n]*:\s*"
+        cleaned_text = re.sub(pattern_identity_start, "", cleaned_text, flags=re.IGNORECASE).strip()
+
+        # B. Speaking for others LATER in the message
+        # If text contains "\nDeepSeek V3: ...", we cut everything after it.
+        pattern_stop_sequence = r"\n(" + "|".join(base_names) + r")[^:\n]*:"
+        match = re.search(pattern_stop_sequence, cleaned_text, flags=re.IGNORECASE)
+        if match:
+            # Cut text at the start of the hallucinated header
+            cleaned_text = cleaned_text[:match.start()].strip()
+
         if not cleaned_text:
             return "Present."
 
-        # B. Python-Side Stop Sequence Enforcement
-        forbidden_speakers = list(AVAILABLE_MODELS.keys()) + ["User", "Claude", "Dall-E", "Bard", "Bing"]
-        
-        for speaker in forbidden_speakers:
-            # Check for "Speaker:" or "\nSpeaker"
-            if f"{speaker}:" in cleaned_text:
-                cleaned_text = cleaned_text.split(f"{speaker}:")[0]
-            elif f"\n{speaker}" in cleaned_text: 
-                 cleaned_text = cleaned_text.split(f"\n{speaker}")[0]
-
-        return cleaned_text.strip()
+        return cleaned_text
 
     def generate_response(self, conversation_history):
         if self.error:
