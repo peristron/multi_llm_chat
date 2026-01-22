@@ -29,11 +29,11 @@ AVAILABLE_MODELS = {
         "icon": "⚫",
         "system_prompt": "You are Grok 3. You are witty, rebellious, and enjoy debating."
     },
-    "Gemini 2.5 Flash": {  # UPDATED: Using the model ID found in your fallback logs
+    "Gemini 2.5 Flash": {
         "api_id": "gemini-2.5-flash", 
         "provider": "google",
         "api_key_name": "GOOGLE_API_KEY",
-        "price_input": 0.075, # Flash pricing is significantly lower
+        "price_input": 0.075,
         "price_output": 0.30,
         "icon": "🔵",
         "system_prompt": "You are Gemini 2.5 Flash. You are fast, efficient, and detailed."
@@ -150,7 +150,8 @@ class Agent:
         # --- SYSTEM PROMPT LOGIC ---
         base_prompt = config["system_prompt"]
         if concise_mode:
-            base_prompt += " Your default behavior is to be brief, concise, and direct. Only provide long or detailed explanations if the user explicitly asks for them."
+            # UPDATED PROMPT: Explicitly forbid speaking for others to fix Gemini hallucination
+            base_prompt += " Your default behavior is to be brief, concise, and direct. Do not speak for other models. Only provide long explanations if asked."
             
         self.system_prompt = base_prompt
         
@@ -159,8 +160,9 @@ class Agent:
 
     def _clean_response(self, text):
         """
-        1. Removes the model's own name from the start (e.g. "GPT-4o: Hello" -> "Hello").
-        2. Chops off text if the model tries to speak for someone else (Post-Processing Stop Sequence).
+        1. Removes the model's own name from the start.
+        2. Chops off text if the model tries to speak for someone else.
+        3. Handles empty responses (e.g. if model only outputted its name).
         """
         if not text:
             return ""
@@ -169,17 +171,19 @@ class Agent:
         pattern = r"^" + re.escape(self.name) + r"[:\-\s]+"
         cleaned_text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
 
+        # FIX: If cleaning removed EVERYTHING (e.g. model just said "GPT-4o"), 
+        # return a default acknowledgement so we don't show an empty bubble.
+        if not cleaned_text:
+            return "Present."
+
         # B. Python-Side Stop Sequence Enforcement
-        # We manually check if the text contains "NextBot:" to prevent hallucinations.
-        # We check for all known model names + "User" + common hallucinations like "Claude" or "Dall-E"
         forbidden_speakers = list(AVAILABLE_MODELS.keys()) + ["User", "Claude", "Dall-E", "Bard", "Bing"]
         
         for speaker in forbidden_speakers:
-            # Check for "Speaker:" or "\nSpeaker:"
-            # We use split to simply take everything BEFORE the hallucinated speaker
+            # Check for "Speaker:" or "\nSpeaker"
             if f"{speaker}:" in cleaned_text:
                 cleaned_text = cleaned_text.split(f"{speaker}:")[0]
-            elif f"\n{speaker}" in cleaned_text: # Handle newlines without colons sometimes
+            elif f"\n{speaker}" in cleaned_text: 
                  cleaned_text = cleaned_text.split(f"\n{speaker}")[0]
 
         return cleaned_text.strip()
@@ -203,7 +207,7 @@ class Agent:
             messages.append({"role": role, "content": content})
 
         try:
-            # API-Level Stop Sequences (OpenAI handles this well)
+            # API-Level Stop Sequences
             stop_sequences = ["User:", "User", "\nUser"]
             for model_name in AVAILABLE_MODELS.keys():
                 stop_sequences.append(f"{model_name}:")
@@ -212,7 +216,7 @@ class Agent:
                 model=self.model_id,
                 messages=messages,
                 temperature=0.7,
-                stop=stop_sequences[:4] # Max 4 stops for OpenAI
+                stop=stop_sequences[:4] 
             )
             content = response.choices[0].message.content
             return content, response.usage.prompt_tokens, response.usage.completion_tokens
@@ -230,7 +234,6 @@ class Agent:
                 role = "user" if msg["role"] == "user" else "model"
                 google_history.append({"role": role, "parts": [f"{msg['name']}: {msg['content']}"]})
 
-            # SAFETY SETTINGS: Prevent silent blocking
             safety_settings = [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -238,9 +241,6 @@ class Agent:
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
             ]
             
-            # NOTE: We DO NOT send stop_sequences to the API here.
-            # We rely on _clean_response (Python side) to chop the text.
-            # This prevents the "empty response" crash.
             response = model.generate_content(
                 google_history, 
                 safety_settings=safety_settings
@@ -257,7 +257,7 @@ class Agent:
         try:
             return execute_gemini(self.model_id, history)
         except Exception as e:
-            # Fallback Logic (Retained just in case 2.5 fails)
+            # Fallback Logic
             error_str = str(e).lower()
             if "404" in error_str or "not found" in error_str:
                 try:
@@ -265,7 +265,7 @@ class Agent:
                     clean_available = [m.replace("models/", "") for m in available_models]
 
                     fallback_model = None
-                    if "gemini-2.0-flash" in clean_available: fallback_model = "gemini-2.0-flash" # Check for 2.0
+                    if "gemini-2.0-flash" in clean_available: fallback_model = "gemini-2.0-flash" 
                     elif "gemini-1.5-flash" in clean_available: fallback_model = "gemini-1.5-flash"
                     elif len(available_models) > 0: fallback_model = available_models[0].replace("models/", "")
 
