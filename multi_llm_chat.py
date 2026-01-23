@@ -74,14 +74,14 @@ def check_password() -> bool:
         entered = st.session_state.get("password", "")
         correct = st.secrets.get("APP_PASSWORD", "")
         if entered and correct and hmac.compare_digest(entered, correct):
-            st.session_state.password_correct = True
+            st.session_state["password_correct"] = True
         else:
-            st.session_state.password_correct = False
+            st.session_state["password_correct"] = False
         # Clear password from state
         if "password" in st.session_state:
             del st.session_state["password"]
 
-    if st.session_state.password_correct:
+    if st.session_state.get("password_correct", False):
         return True
 
     st.title("🔒 Login Required")
