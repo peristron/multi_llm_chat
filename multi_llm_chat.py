@@ -364,9 +364,8 @@ class Agent:
     def _google_fallback(self, execute_fn, original_error: str) -> Tuple[str, int, int]:
         """Attempt to use fallback Gemini models."""
         fallback_models = [
-            "gemini-2.5-flash-preview-05-20",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash", 
             "gemini-1.5-flash",
             "gemini-1.5-flash-latest",
             "gemini-1.5-pro"
