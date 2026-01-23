@@ -60,8 +60,7 @@ def init_session_state():
     defaults = {
         "messages": [],
         "session_cost": 0.0,
-        "total_tokens": 0,
-        "password_correct": False
+        "total_tokens": 0
     }
     for key, value in defaults.items():
         if key not in st.session_state:
