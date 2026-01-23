@@ -403,7 +403,7 @@ class Agent:
         placeholder,
         image_b64: Optional[str] = None
     ) -> Tuple[str, int, int]:
-        """Stream from Google Gemini API."""
+        """Stream from Google Gemini API with fallback to non-streaming."""
         
         genai.configure(api_key=self.api_key)
         
@@ -443,6 +443,7 @@ class Agent:
             "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
         }
         
+        # Try streaming first, fall back to non-streaming if issues
         try:
             response = model.generate_content(
                 google_history,
@@ -452,19 +453,15 @@ class Agent:
             
             full_response = ""
             for chunk in response:
-                # Safely extract text from chunk
                 try:
                     chunk_text = chunk.text
                     if chunk_text:
                         full_response += chunk_text
                         placeholder.markdown(f"**{self.name}**: {full_response}▌")
                 except (ValueError, AttributeError):
-                    # Chunk doesn't have valid text (empty part or blocked), skip it
                     continue
             
-            # Handle empty response
             if not full_response.strip():
-                # Check if response was blocked
                 try:
                     if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
                         full_response = "Response was blocked by safety filters."
@@ -475,7 +472,6 @@ class Agent:
             
             placeholder.markdown(f"**{self.name}**: {full_response}")
             
-            # Get token counts from final response
             try:
                 usage = response.usage_metadata
                 in_tok = getattr(usage, 'prompt_token_count', len(str(google_history)) // 4)
@@ -489,83 +485,69 @@ class Agent:
         except Exception as e:
             error_str = str(e).lower()
             
-            # Handle rate limiting
+            # Handle rate limiting - try non-streaming as fallback
             if "429" in str(e) or "quota" in error_str or "rate" in error_str:
-                # Try to extract retry time
-                import re
-                retry_match = re.search(r'retry in (\d+)', error_str)
-                retry_seconds = retry_match.group(1) if retry_match else "60"
-                return f"⚠️ Rate limit reached. Please wait ~{retry_seconds}s or check your [Google AI quota](https://ai.google.dev/gemini-api/docs/rate-limits).", 0, 0
+                return self._call_google_non_streaming(google_history, safety_settings, placeholder, str(e))
             
             # Handle model not found
             if "404" in error_str or "not found" in error_str:
                 return self._google_fallback_stream(history, placeholder, str(e))
             
             return f"⚠️ Google API Error: {str(e)}", 0, 0
-    
-    def _google_fallback_stream(
-        self, 
-        history: List[Dict], 
-        placeholder, 
+
+    def _call_google_non_streaming(
+        self,
+        google_history: List[Dict],
+        safety_settings: Dict,
+        placeholder,
         original_error: str
     ) -> Tuple[str, int, int]:
-        """Fallback to alternative Gemini models."""
+        """Non-streaming fallback for Gemini (matches original working code)."""
         
-        fallback_models = [
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-pro"
-        ]
-        
-        fallback_models = [m for m in fallback_models if m != self.model_id]
+        # Try a different model that may have separate quota
+        fallback_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
         
         for fallback_model in fallback_models:
             try:
-                placeholder.markdown(f"*Trying {fallback_model}...*")
+                placeholder.markdown(f"**{self.name}**: *Trying {fallback_model}...*")
                 
-                genai.configure(api_key=self.api_key)
                 model = genai.GenerativeModel(
                     fallback_model,
                     system_instruction=self.system_prompt
                 )
                 
-                google_history = []
-                for msg in history:
-                    role = "user" if msg["role"] == "user" else "model"
-                    content = self._format_history_message(msg)
-                    google_history.append({"role": role, "parts": [content]})
-
-                safety_settings = {
-                    "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-                    "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-                    "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-                    "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-                }
-                
                 response = model.generate_content(
                     google_history,
-                    safety_settings=safety_settings,
-                    stream=True
+                    safety_settings=safety_settings
                 )
                 
-                full_response = ""
-                for chunk in response:
-                    if chunk.text:
-                        full_response += chunk.text
-                        placeholder.markdown(f"**{self.name}**: {full_response}▌")
+                try:
+                    text = response.text
+                except ValueError:
+                    continue
                 
-                full_response += f"\n\n*(Switched to {fallback_model})*"
-                placeholder.markdown(f"**{self.name}**: {full_response}")
+                if not text or not text.strip():
+                    continue
                 
-                in_tok = len(str(google_history)) // 4
-                out_tok = len(full_response) // 4
-                return full_response, in_tok, out_tok
+                text += f"\n\n*(Used {fallback_model} due to rate limits)*"
+                placeholder.markdown(f"**{self.name}**: {text}")
                 
-            except Exception:
+                usage = response.usage_metadata
+                in_tok = getattr(usage, 'prompt_token_count', 0)
+                out_tok = getattr(usage, 'candidates_token_count', 0)
+                
+                return text, in_tok, out_tok
+                
+            except Exception as fallback_e:
+                fallback_error = str(fallback_e).lower()
+                # If this model is also rate limited, try next one
+                if "429" in str(fallback_e) or "quota" in fallback_error:
+                    continue
+                # For other errors, also try next
                 continue
         
-        return f"⚠️ All Gemini models unavailable. Error: {original_error}", 0, 0
+        # All fallbacks failed
+        return f"⚠️ All Gemini models rate-limited. Please wait a minute and try again, or check your [quota](https://ai.google.dev/gemini-api/docs/rate-limits).", 0, 0
 
 
 # --- 6. SIDEBAR ---
