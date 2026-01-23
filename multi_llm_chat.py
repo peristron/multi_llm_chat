@@ -33,7 +33,7 @@ AVAILABLE_MODELS = {
         "mention_triggers": ["grok", "grok3", "xai"]
     },
     "Gemini 2.5 Flash": {
-        "api_id": "gemini-2.5-flash-preview-05-20",
+        "api_id": "gemini-2.5-flash",
         "provider": "google",
         "api_key_name": "GOOGLE_API_KEY",
         "price_input": 0.075,
