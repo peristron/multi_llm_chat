@@ -488,10 +488,21 @@ class Agent:
             
         except Exception as e:
             error_str = str(e).lower()
+            
+            # Handle rate limiting
+            if "429" in str(e) or "quota" in error_str or "rate" in error_str:
+                # Try to extract retry time
+                import re
+                retry_match = re.search(r'retry in (\d+)', error_str)
+                retry_seconds = retry_match.group(1) if retry_match else "60"
+                return f"⚠️ Rate limit reached. Please wait ~{retry_seconds}s or check your [Google AI quota](https://ai.google.dev/gemini-api/docs/rate-limits).", 0, 0
+            
+            # Handle model not found
             if "404" in error_str or "not found" in error_str:
                 return self._google_fallback_stream(history, placeholder, str(e))
+            
             return f"⚠️ Google API Error: {str(e)}", 0, 0
-
+    
     def _google_fallback_stream(
         self, 
         history: List[Dict], 
