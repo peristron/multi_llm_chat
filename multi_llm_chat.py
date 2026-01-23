@@ -428,8 +428,6 @@ class Agent:
         if image_b64 and self.supports_vision and google_history:
             for i in range(len(google_history) - 1, -1, -1):
                 if google_history[i]["role"] == "user":
-                    import base64 as b64module
-                    image_bytes = b64module.b64decode(image_b64)
                     google_history[i]["parts"].append({
                         "inline_data": {
                             "mime_type": "image/jpeg",
@@ -454,9 +452,26 @@ class Agent:
             
             full_response = ""
             for chunk in response:
-                if chunk.text:
-                    full_response += chunk.text
-                    placeholder.markdown(f"**{self.name}**: {full_response}▌")
+                # Safely extract text from chunk
+                try:
+                    chunk_text = chunk.text
+                    if chunk_text:
+                        full_response += chunk_text
+                        placeholder.markdown(f"**{self.name}**: {full_response}▌")
+                except (ValueError, AttributeError):
+                    # Chunk doesn't have valid text (empty part or blocked), skip it
+                    continue
+            
+            # Handle empty response
+            if not full_response.strip():
+                # Check if response was blocked
+                try:
+                    if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+                        full_response = "Response was blocked by safety filters."
+                    else:
+                        full_response = "Received your message but generated an empty response."
+                except:
+                    full_response = "Received your message but generated an empty response."
             
             placeholder.markdown(f"**{self.name}**: {full_response}")
             
