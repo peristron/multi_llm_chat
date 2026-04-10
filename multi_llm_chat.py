@@ -8,6 +8,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from openai import OpenAI
 import google.generativeai as genai
 import base64
+from pathlib import Path
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Multi-LLM Chat", page_icon="🤖", layout="wide")
@@ -78,6 +79,7 @@ PROMPT_TEMPLATES = {
 
 # --- 2. SESSION STATE INITIALIZATION ---
 def init_session_state():
+    """Initialize session state with default values."""
     defaults = {
         "messages": [],
         "session_cost": 0.0,
@@ -85,7 +87,8 @@ def init_session_state():
         "custom_prompts": {name: config["default_system_prompt"] for name, config in AVAILABLE_MODELS.items()},
         "message_id_counter": 0,
         "uploaded_image": None,
-        "uploaded_image_b64": None
+        "uploaded_image_b64": None,
+        "password_correct": False
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -95,15 +98,17 @@ init_session_state()
 
 # --- 3. AUTHENTICATION ---
 def check_password() -> bool:
+    """Handle password authentication with constant-time comparison."""
     def password_entered():
         entered = st.session_state.get("password", "")
         correct = st.secrets.get("APP_PASSWORD", "")
         if entered and correct and hmac.compare_digest(entered, correct):
             st.session_state["password_correct"] = True
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
-        if "password" in st.session_state:
-            del st.session_state["password"]
+            if "password" in st.session_state:
+                del st.session_state["password"]
 
     if st.session_state.get("password_correct", False):
         return True
@@ -154,11 +159,11 @@ with st.expander("📚 How to use this app", expanded=False):
 
 @st.cache_resource
 def get_openai_client(api_key: str, base_url: Optional[str] = None) -> OpenAI:
-    """Cache OpenAI-compatible clients."""
+    """Cache OpenAI-compatible clients to avoid recreation."""
     return OpenAI(api_key=api_key, base_url=base_url)
 
 def get_api_key(key_name: str, user_provided_key: Optional[str] = None) -> Optional[str]:
-    """Get API key from user input or secrets."""
+    """Get API key from user input or secrets with fallback."""
     if user_provided_key:
         return user_provided_key
     return st.secrets.get(key_name)
@@ -193,8 +198,12 @@ def parse_mentions(user_input: str, active_agents: List['Agent']) -> List['Agent
     return mentioned_agents if mentioned_agents else active_agents
 
 def export_chat_markdown() -> str:
-    """Export chat history as Markdown."""
-    lines = ["# Chat Export", f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*", ""]
+    """Export chat history as Markdown with metadata."""
+    lines = [
+        "# Chat Export",
+        f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+        ""
+    ]
     
     for msg in st.session_state.messages:
         name = msg.get("name", "Unknown")
@@ -204,16 +213,20 @@ def export_chat_markdown() -> str:
         lines.append(content)
         if msg.get("response_time"):
             lines.append(f"*Response time: {msg['response_time']:.2f}s*")
+        if msg.get("is_debate"):
+            lines.append("*[Debate Round]*")
         lines.append("")
     
-    lines.append("---")
-    lines.append(f"**Total Cost:** ${st.session_state.session_cost:.5f}")
-    lines.append(f"**Total Tokens:** {st.session_state.total_tokens:,}")
+    lines.extend([
+        "---",
+        f"**Total Cost:** ${st.session_state.session_cost:.5f}",
+        f"**Total Tokens:** {st.session_state.total_tokens:,}"
+    ])
     
     return "\n".join(lines)
 
 def export_chat_json() -> str:
-    """Export chat history as JSON."""
+    """Export chat history as JSON with full metadata."""
     export_data = {
         "exported_at": datetime.now().isoformat(),
         "session_cost": st.session_state.session_cost,
@@ -223,14 +236,36 @@ def export_chat_json() -> str:
     return json.dumps(export_data, indent=2)
 
 def encode_image_to_base64(uploaded_file) -> Optional[str]:
-    """Encode uploaded image to base64."""
+    """Encode uploaded image to base64 string."""
     if uploaded_file is not None:
         bytes_data = uploaded_file.getvalue()
         return base64.standard_b64encode(bytes_data).decode("utf-8")
     return None
 
+def safe_get_image_mime_type(uploaded_file) -> str:
+    """Safely determine image MIME type from uploaded file."""
+    if uploaded_file is None:
+        return "image/jpeg"
+    
+    file_type = uploaded_file.type
+    if file_type:
+        return file_type
+    
+    # Fallback: detect from filename
+    name = uploaded_file.name.lower()
+    if name.endswith('.png'):
+        return "image/png"
+    elif name.endswith('.gif'):
+        return "image/gif"
+    elif name.endswith('.webp'):
+        return "image/webp"
+    else:
+        return "image/jpeg"
+
 # --- 5. AGENT CLASS ---
 class Agent:
+    """AI Agent that handles model interactions."""
+    
     KNOWN_AI_NAMES = [
         "User", "Human", "Claude", "Anthropic", "Dall-E", "Bard", "Bing",
         "GPT", "GPT-4", "GPT-4o", "ChatGPT", "OpenAI",
@@ -254,10 +289,10 @@ class Agent:
         self.model_id = config["api_id"]
         self.provider = config["provider"]
         self.avatar = config["icon"]
-        self.temperature = temperature
+        self.temperature = max(0.0, min(2.0, temperature))  # Clamp temperature
         self.supports_vision = config.get("supports_vision", False)
         
-        # Use custom prompt if provided, else default
+        # Build system prompt
         base_prompt = custom_system_prompt or config["default_system_prompt"]
         if concise_mode:
             base_prompt += (
@@ -269,20 +304,23 @@ class Agent:
             )
         self.system_prompt = base_prompt
         
+        # Get API key
         self.api_key = get_api_key(config["api_key_name"], user_key)
         self.error = None if self.api_key else f"Missing API Key: {config['api_key_name']}"
 
     def _clean_response(self, text: str) -> str:
-        """Clean model response of identity headers."""
+        """Clean model response of identity headers and artifacts."""
         if not text or not text.strip():
             return "..."
         
         text = text.strip()
         
+        # Build pattern for known AI names
         escaped_names = [re.escape(name) for name in self.KNOWN_AI_NAMES]
         escaped_names.extend([re.escape(name) for name in AVAILABLE_MODELS.keys()])
         names_pattern = "|".join(escaped_names)
         
+        # Remove leading identity markers
         patterns_to_remove = [
             rf"^\[?({names_pattern})\]?\s*[:\-]\s*",
             rf"^\*\*({names_pattern})\*\*\s*[:\-]?\s*",
@@ -290,11 +328,13 @@ class Agent:
         for pattern in patterns_to_remove:
             text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
         
+        # Remove mid-text identity continuation
         continuation_pattern = rf"\n\s*\[?({names_pattern})\]?\s*[:\-]"
         match = re.search(continuation_pattern, text, flags=re.IGNORECASE)
         if match:
             text = text[:match.start()].strip()
         
+        # Remove markdown identity continuation
         md_continuation = rf"\n\s*\*\*({names_pattern})\*\*\s*[:\-]?"
         match = re.search(md_continuation, text, flags=re.IGNORECASE)
         if match:
@@ -323,16 +363,23 @@ class Agent:
         
         try:
             if self.provider == "google":
-                content, in_tok, out_tok = self._stream_google(conversation_history, placeholder, image_b64)
+                content, in_tok, out_tok = self._stream_google(
+                    conversation_history, placeholder, image_b64
+                )
             else:
-                content, in_tok, out_tok = self._stream_openai_compatible(conversation_history, placeholder, image_b64)
+                content, in_tok, out_tok = self._stream_openai_compatible(
+                    conversation_history, placeholder, image_b64
+                )
             
             elapsed = time.time() - start_time
             return self._clean_response(content), in_tok, out_tok, elapsed
             
         except Exception as e:
             elapsed = time.time() - start_time
-            return f"⚠️ Error: {str(e)}", 0, 0, elapsed
+            error_msg = str(e)
+            # Log error for debugging (won't display to user in production)
+            print(f"Error in {self.name}: {error_msg}")
+            return f"⚠️ Error: {error_msg}", 0, 0, elapsed
 
     def _stream_openai_compatible(
         self, 
@@ -340,10 +387,11 @@ class Agent:
         placeholder,
         image_b64: Optional[str] = None
     ) -> Tuple[str, int, int]:
-        """Stream from OpenAI-compatible API."""
+        """Stream from OpenAI-compatible API with improved error handling."""
         
         messages = [{"role": "system", "content": self.system_prompt}]
         
+        # Build conversation history
         for msg in history:
             role = "user" if msg["role"] == "user" else "assistant"
             content = self._format_history_message(msg)
@@ -361,7 +409,10 @@ class Agent:
                 text_content = messages[last_user_idx]["content"]
                 messages[last_user_idx]["content"] = [
                     {"type": "text", "text": text_content},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
+                    }
                 ]
 
         try:
@@ -377,13 +428,15 @@ class Agent:
             
             full_response = ""
             for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    full_response += chunk.choices[0].delta.content
-                    placeholder.markdown(f"**{self.name}**: {full_response}▌")
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta_content = chunk.choices[0].delta.content
+                    if delta_content:
+                        full_response += delta_content
+                        placeholder.markdown(f"**{self.name}**: {full_response}▌")
             
             placeholder.markdown(f"**{self.name}**: {full_response}")
             
-            # Estimate tokens (streaming doesn't return usage)
+            # Estimate tokens (streaming doesn't always return usage)
             in_tok = sum(len(str(m.get("content", ""))) // 4 for m in messages)
             out_tok = len(full_response) // 4
             
@@ -392,9 +445,11 @@ class Agent:
         except Exception as e:
             error_msg = str(e).lower()
             if "rate" in error_msg and "limit" in error_msg:
-                return "⚠️ Rate limit reached. Please wait.", 0, 0
+                return "⚠️ Rate limit reached. Please wait and try again.", 0, 0
             elif "invalid" in error_msg and "key" in error_msg:
                 return "⚠️ Invalid API key.", 0, 0
+            elif "quota" in error_msg or "insufficient" in error_msg:
+                return "⚠️ API quota exceeded. Check your billing.", 0, 0
             return f"⚠️ API Error: {str(e)}", 0, 0
 
     def _stream_google(
@@ -403,21 +458,28 @@ class Agent:
         placeholder,
         image_b64: Optional[str] = None
     ) -> Tuple[str, int, int]:
-        """Stream from Google Gemini API with fallback to non-streaming."""
+        """Stream from Google Gemini API with improved fallback handling."""
         
-        genai.configure(api_key=self.api_key)
+        try:
+            genai.configure(api_key=self.api_key)
+        except Exception as e:
+            return f"⚠️ Failed to configure Google API: {str(e)}", 0, 0
         
         generation_config = genai.types.GenerationConfig(
             max_output_tokens=2048,
             temperature=self.temperature
         )
         
-        model = genai.GenerativeModel(
-            self.model_id,
-            system_instruction=self.system_prompt,
-            generation_config=generation_config
-        )
+        try:
+            model = genai.GenerativeModel(
+                self.model_id,
+                system_instruction=self.system_prompt,
+                generation_config=generation_config
+            )
+        except Exception as e:
+            return f"⚠️ Failed to initialize model: {str(e)}", 0, 0
         
+        # Build Google-formatted history
         google_history = []
         for msg in history:
             role = "user" if msg["role"] == "user" else "model"
@@ -443,7 +505,7 @@ class Agent:
             "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
         }
         
-        # Try streaming first, fall back to non-streaming if issues
+        # Try streaming first
         try:
             response = model.generate_content(
                 google_history,
@@ -452,26 +514,32 @@ class Agent:
             )
             
             full_response = ""
+            chunk_count = 0
+            
             for chunk in response:
                 try:
                     chunk_text = chunk.text
                     if chunk_text:
                         full_response += chunk_text
                         placeholder.markdown(f"**{self.name}**: {full_response}▌")
-                except (ValueError, AttributeError):
+                        chunk_count += 1
+                except (ValueError, AttributeError) as chunk_error:
+                    # Some chunks may not have text, continue
                     continue
             
+            # Handle empty response
             if not full_response.strip():
                 try:
                     if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-                        full_response = "Response was blocked by safety filters."
+                        full_response = "⚠️ Response was blocked by safety filters."
                     else:
-                        full_response = "Received your message but generated an empty response."
+                        full_response = "⚠️ Received your message but generated an empty response."
                 except:
-                    full_response = "Received your message but generated an empty response."
+                    full_response = "⚠️ Received your message but generated an empty response."
             
             placeholder.markdown(f"**{self.name}**: {full_response}")
             
+            # Extract token usage
             try:
                 usage = response.usage_metadata
                 in_tok = getattr(usage, 'prompt_token_count', len(str(google_history)) // 4)
@@ -485,13 +553,17 @@ class Agent:
         except Exception as e:
             error_str = str(e).lower()
             
-            # Handle rate limiting - try non-streaming as fallback
+            # Handle rate limiting - try non-streaming fallback
             if "429" in str(e) or "quota" in error_str or "rate" in error_str:
-                return self._call_google_non_streaming(google_history, safety_settings, placeholder, str(e))
+                return self._call_google_non_streaming(
+                    google_history, safety_settings, placeholder, model
+                )
             
             # Handle model not found
             if "404" in error_str or "not found" in error_str:
-                return self._google_fallback_stream(history, placeholder, str(e))
+                return self._google_fallback_different_model(
+                    google_history, safety_settings, placeholder, str(e)
+                )
             
             return f"⚠️ Google API Error: {str(e)}", 0, 0
 
@@ -500,23 +572,22 @@ class Agent:
         google_history: List[Dict],
         safety_settings: Dict,
         placeholder,
-        original_error: str
+        model
     ) -> Tuple[str, int, int]:
-        """Non-streaming fallback for Gemini (matches original working code)."""
+        """Non-streaming fallback for Gemini when rate-limited."""
         
-        # Try a different model that may have separate quota
         fallback_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
         
-        for fallback_model in fallback_models:
+        for fallback_model_name in fallback_models:
             try:
-                placeholder.markdown(f"**{self.name}**: *Trying {fallback_model}...*")
+                placeholder.markdown(f"**{self.name}**: *Trying {fallback_model_name}...*")
                 
-                model = genai.GenerativeModel(
-                    fallback_model,
+                fallback_model = genai.GenerativeModel(
+                    fallback_model_name,
                     system_instruction=self.system_prompt
                 )
                 
-                response = model.generate_content(
+                response = fallback_model.generate_content(
                     google_history,
                     safety_settings=safety_settings
                 )
@@ -529,7 +600,7 @@ class Agent:
                 if not text or not text.strip():
                     continue
                 
-                text += f"\n\n*(Used {fallback_model} due to rate limits)*"
+                text += f"\n\n*(Used {fallback_model_name} due to rate limits)*"
                 placeholder.markdown(f"**{self.name}**: {text}")
                 
                 usage = response.usage_metadata
@@ -540,14 +611,72 @@ class Agent:
                 
             except Exception as fallback_e:
                 fallback_error = str(fallback_e).lower()
-                # If this model is also rate limited, try next one
+                # If rate limited, try next model
                 if "429" in str(fallback_e) or "quota" in fallback_error:
                     continue
-                # For other errors, also try next
                 continue
         
         # All fallbacks failed
-        return f"⚠️ All Gemini models rate-limited. Please wait a minute and try again, or check your [quota](https://ai.google.dev/gemini-api/docs/rate-limits).", 0, 0
+        return (
+            "⚠️ All Gemini models are currently rate-limited. "
+            "Please wait a minute and try again, or check your "
+            "[quota](https://ai.google.dev/gemini-api/docs/rate-limits)."
+        ), 0, 0
+
+    def _google_fallback_different_model(
+        self,
+        google_history: List[Dict],
+        safety_settings: Dict,
+        placeholder,
+        original_error: str
+    ) -> Tuple[str, int, int]:
+        """Try different Gemini model when primary model not found."""
+        
+        fallback_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+        
+        for fallback_model_name in fallback_models:
+            try:
+                placeholder.markdown(f"**{self.name}**: *Trying {fallback_model_name}...*")
+                
+                model = genai.GenerativeModel(
+                    fallback_model_name,
+                    system_instruction=self.system_prompt
+                )
+                
+                response = model.generate_content(
+                    google_history,
+                    safety_settings=safety_settings,
+                    stream=True
+                )
+                
+                full_response = ""
+                for chunk in response:
+                    try:
+                        chunk_text = chunk.text
+                        if chunk_text:
+                            full_response += chunk_text
+                            placeholder.markdown(f"**{self.name}**: {full_response}▌")
+                    except (ValueError, AttributeError):
+                        continue
+                
+                if full_response.strip():
+                    full_response += f"\n\n*(Used {fallback_model_name} as fallback)*"
+                    placeholder.markdown(f"**{self.name}**: {full_response}")
+                    
+                    try:
+                        usage = response.usage_metadata
+                        in_tok = getattr(usage, 'prompt_token_count', 0)
+                        out_tok = getattr(usage, 'candidates_token_count', 0)
+                    except:
+                        in_tok = len(str(google_history)) // 4
+                        out_tok = len(full_response) // 4
+                    
+                    return full_response, in_tok, out_tok
+                    
+            except Exception:
+                continue
+        
+        return f"⚠️ Model not found: {original_error}", 0, 0
 
 
 # --- 6. SIDEBAR ---
@@ -563,7 +692,7 @@ with st.sidebar:
     )
     
     if not selected_models:
-        st.warning("Please select at least one model.")
+        st.warning("⚠️ Please select at least one model.")
 
     st.divider()
     
@@ -607,7 +736,10 @@ with st.sidebar:
         for model_name in selected_models:
             new_prompt = st.text_area(
                 f"{AVAILABLE_MODELS[model_name]['icon']} {model_name}",
-                value=st.session_state.custom_prompts.get(model_name, AVAILABLE_MODELS[model_name]["default_system_prompt"]),
+                value=st.session_state.custom_prompts.get(
+                    model_name, 
+                    AVAILABLE_MODELS[model_name]["default_system_prompt"]
+                ),
                 height=80,
                 key=f"prompt_{model_name}"
             )
@@ -625,7 +757,7 @@ with st.sidebar:
     if uploaded_file:
         st.session_state.uploaded_image = uploaded_file
         st.session_state.uploaded_image_b64 = encode_image_to_base64(uploaded_file)
-        st.image(uploaded_file, width=150)
+        st.image(uploaded_file, width=150, caption=uploaded_file.name)
         if st.button("🗑️ Remove Image", use_container_width=True):
             st.session_state.uploaded_image = None
             st.session_state.uploaded_image_b64 = None
@@ -676,24 +808,30 @@ with st.sidebar:
     col_exp1, col_exp2 = st.columns(2)
     
     with col_exp1:
-        md_export = export_chat_markdown()
-        st.download_button(
-            "📄 Markdown",
-            data=md_export,
-            file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-            mime="text/markdown",
-            use_container_width=True
-        )
+        if st.session_state.messages:
+            md_export = export_chat_markdown()
+            st.download_button(
+                "📄 Markdown",
+                data=md_export,
+                file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+        else:
+            st.button("📄 Markdown", disabled=True, use_container_width=True)
     
     with col_exp2:
-        json_export = export_chat_json()
-        st.download_button(
-            "📋 JSON",
-            data=json_export,
-            file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
-            use_container_width=True
-        )
+        if st.session_state.messages:
+            json_export = export_chat_json()
+            st.download_button(
+                "📋 JSON",
+                data=json_export,
+                file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        else:
+            st.button("📋 JSON", disabled=True, use_container_width=True)
     
     # Actions
     st.divider()
@@ -735,7 +873,7 @@ for i, message in enumerate(st.session_state.messages):
     avatar = message.get("avatar", "👤" if message["role"] == "user" else "🤖")
     
     with st.chat_message(message["role"], avatar=avatar):
-        col_msg, col_meta = st.columns([0.9, 0.1])
+        col_msg, col_meta = st.columns([0.85, 0.15])
         
         with col_msg:
             st.markdown(f"**{message['name']}**: {message['content']}")
@@ -744,6 +882,10 @@ for i, message in enumerate(st.session_state.messages):
             # Show response time for assistant messages
             if message["role"] == "assistant" and message.get("response_time"):
                 st.caption(f"⏱️ {message['response_time']:.1f}s")
+            
+            # Show debate indicator
+            if message.get("is_debate"):
+                st.caption("🔄")
 
 # --- RETRY FUNCTION ---
 def retry_message(message_id: int, agent_name: str):
@@ -762,10 +904,10 @@ retry_agent_name = st.session_state.pop("retry_agent", None)
 # Process chat input
 placeholder_text = "Type your message..." if active_agents else "← Select models first"
 
-if user_input := st.chat_input(placeholder_text):
+if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
     
     if not active_agents:
-        st.error("Please select at least one AI model from the sidebar.")
+        st.error("⚠️ Please select at least one AI model from the sidebar.")
         st.stop()
 
     # Apply template if selected
@@ -851,7 +993,7 @@ if user_input := st.chat_input(placeholder_text):
                 with col_time:
                     st.caption(f"⏱️ {elapsed:.1f}s")
                 with col_retry:
-                    if st.button("🔄", key=f"retry_{msg_id}", help="Retry"):
+                    if st.button("🔄", key=f"retry_{msg_id}", help="Retry this response"):
                         retry_message(msg_id, agent.name)
                 
                 cost = calculate_cost(agent.name, in_tok, out_tok)
@@ -886,7 +1028,7 @@ if user_input := st.chat_input(placeholder_text):
                     "is_debate": True
                 })
                 
-                st.caption(f"⏱️ {elapsed:.1f}s")
+                st.caption(f"⏱️ {elapsed:.1f}s • Debate Round")
                 
                 cost = calculate_cost(agent.name, in_tok, out_tok)
                 st.session_state.session_cost += cost
