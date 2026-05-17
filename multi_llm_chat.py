@@ -8,6 +8,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from openai import OpenAI
 import google.generativeai as genai
 import base64
+import traceback
 from pathlib import Path
 
 # --- 1. CONFIGURATION ---
@@ -77,6 +78,24 @@ PROMPT_TEMPLATES = {
     "Step by Step": "Explain this step by step:\n\n"
 }
 
+SYSTEM_PROMPT_PRESETS = {
+    "Default model prompts": None,
+    "Concise Analyst": "You are a concise analyst. Answer directly, structure your response, and call out assumptions and uncertainty.",
+    "Code Reviewer": "You are a senior software engineer. Review code for correctness, safety, performance, maintainability, and deployment risk. Prioritize actionable fixes.",
+    "Academic Tutor": "You are an academic tutor. Explain clearly, define terms, and provide examples while avoiding unnecessary jargon.",
+    "Executive Summary": "You are an executive briefing assistant. Summarize key points, risks, decisions, and recommended next actions.",
+    "Adversarial Reviewer": "You are a careful adversarial reviewer. Identify weaknesses, edge cases, hidden assumptions, and counterarguments constructively."
+}
+
+HISTORY_LIMIT_OPTIONS = {
+    "Last 5 messages": 5,
+    "Last 10 messages": 10,
+    "Last 20 messages": 20,
+    "All messages": None,
+}
+
+GEMINI_SAFETY_MODES = ["Default", "Relaxed", "Block none"]
+
 # --- 2. SESSION STATE INITIALIZATION ---
 def init_session_state():
     """Initialize session state with default values."""
@@ -88,7 +107,9 @@ def init_session_state():
         "message_id_counter": 0,
         "uploaded_image": None,
         "uploaded_image_b64": None,
-        "password_correct": False
+        "uploaded_image_mime": None,
+        "password_correct": None,
+        "conversation_title": "Untitled Chat"
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -158,9 +179,9 @@ with st.expander("📚 How to use this app", expanded=False):
 # --- 4. HELPER FUNCTIONS ---
 
 @st.cache_resource
-def get_openai_client(api_key: str, base_url: Optional[str] = None) -> OpenAI:
+def get_openai_client(api_key: str, base_url: Optional[str] = None, timeout: int = 60) -> OpenAI:
     """Cache OpenAI-compatible clients to avoid recreation."""
-    return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
 def get_api_key(key_name: str, user_provided_key: Optional[str] = None) -> Optional[str]:
     """Get API key from user input or secrets with fallback."""
@@ -200,7 +221,7 @@ def parse_mentions(user_input: str, active_agents: List['Agent']) -> List['Agent
 def export_chat_markdown() -> str:
     """Export chat history as Markdown with metadata."""
     lines = [
-        "# Chat Export",
+        f"# {st.session_state.get('conversation_title', 'Chat Export')}",
         f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
         ""
     ]
@@ -212,7 +233,14 @@ def export_chat_markdown() -> str:
         lines.append(f"### {role_icon} {name}")
         lines.append(content)
         if msg.get("response_time"):
-            lines.append(f"*Response time: {msg['response_time']:.2f}s*")
+            meta_parts = [f"Response time: {msg['response_time']:.2f}s"]
+            if msg.get("model_id"):
+                meta_parts.append(f"Model: {msg.get('model_id')}")
+            if msg.get("input_tokens") is not None and msg.get("output_tokens") is not None:
+                meta_parts.append(f"Tokens: {msg.get('input_tokens', 0):,} in / {msg.get('output_tokens', 0):,} out")
+            if msg.get("estimated_cost") is not None:
+                meta_parts.append(f"Estimated cost: ${msg.get('estimated_cost', 0.0):.5f}")
+            lines.append("*" + " · ".join(meta_parts) + "*")
         if msg.get("is_debate"):
             lines.append("*[Debate Round]*")
         lines.append("")
@@ -228,6 +256,7 @@ def export_chat_markdown() -> str:
 def export_chat_json() -> str:
     """Export chat history as JSON with full metadata."""
     export_data = {
+        "title": st.session_state.get("conversation_title", "Untitled Chat"),
         "exported_at": datetime.now().isoformat(),
         "session_cost": st.session_state.session_cost,
         "total_tokens": st.session_state.total_tokens,
@@ -262,6 +291,73 @@ def safe_get_image_mime_type(uploaded_file) -> str:
     else:
         return "image/jpeg"
 
+
+def get_limited_history(messages: List[Dict], limit: Optional[int]) -> List[Dict]:
+    """Return recent conversation messages, preserving all messages when limit is None."""
+    if limit is None or limit <= 0:
+        return messages
+    return messages[-limit:]
+
+
+def get_safe_api_error(provider_name: str = "API") -> str:
+    """User-facing error text that avoids exposing raw provider internals."""
+    return f"⚠️ {provider_name} request failed. Check the app logs or provider dashboard for details."
+
+
+def log_exception(context: str, exc: Exception) -> None:
+    """Print detailed errors to Streamlit Cloud logs without exposing them in the UI."""
+    print(f"[{datetime.now().isoformat()}] {context}: {exc}")
+    print(traceback.format_exc())
+
+
+def build_gemini_safety_settings(mode: str) -> Optional[Dict[str, str]]:
+    """Return Gemini safety settings for the selected mode."""
+    if mode == "Block none":
+        return {
+            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
+        }
+    if mode == "Relaxed":
+        return {
+            "HARM_CATEGORY_HARASSMENT": "BLOCK_ONLY_HIGH",
+            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_ONLY_HIGH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_ONLY_HIGH",
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_ONLY_HIGH",
+        }
+    return None
+
+
+def model_has_api_key(model_name: str, user_keys: Dict[str, str]) -> bool:
+    """Check whether a selected model has a key from secrets or sidebar input."""
+    key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
+    return bool(user_keys.get(model_name) or st.secrets.get(key_name))
+
+
+def add_assistant_message(agent: 'Agent', content: str, elapsed: float, in_tok: int, out_tok: int, *, is_debate: bool = False, is_judge: bool = False) -> int:
+    """Append an assistant message with export-friendly metadata."""
+    cost = calculate_cost(agent.name, in_tok, out_tok)
+    msg_id = get_next_message_id()
+    st.session_state.messages.append({
+        "id": msg_id,
+        "role": "assistant",
+        "name": agent.name,
+        "content": content,
+        "avatar": agent.avatar,
+        "response_time": elapsed,
+        "provider": agent.provider,
+        "model_id": agent.model_id,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "estimated_cost": cost,
+        "is_debate": is_debate,
+        "is_judge": is_judge,
+    })
+    st.session_state.session_cost += cost
+    st.session_state.total_tokens += (in_tok + out_tok)
+    return msg_id
+
 # --- 5. AGENT CLASS ---
 class Agent:
     """AI Agent that handles model interactions."""
@@ -282,7 +378,9 @@ class Agent:
         user_key: Optional[str] = None,
         concise_mode: bool = True,
         temperature: float = 0.7,
-        custom_system_prompt: Optional[str] = None
+        custom_system_prompt: Optional[str] = None,
+        gemini_safety_mode: str = "Default",
+        request_timeout: int = 60
     ):
         self.name = display_name
         self.config = config
@@ -291,6 +389,8 @@ class Agent:
         self.avatar = config["icon"]
         self.temperature = max(0.0, min(2.0, temperature))  # Clamp temperature
         self.supports_vision = config.get("supports_vision", False)
+        self.gemini_safety_mode = gemini_safety_mode
+        self.request_timeout = max(10, min(180, int(request_timeout)))
         
         # Build system prompt
         base_prompt = custom_system_prompt or config["default_system_prompt"]
@@ -352,7 +452,8 @@ class Agent:
         self, 
         conversation_history: List[Dict],
         placeholder,
-        image_b64: Optional[str] = None
+        image_b64: Optional[str] = None,
+        image_mime: str = "image/jpeg"
     ) -> Tuple[str, int, int, float]:
         """Generate streaming response. Returns (content, in_tokens, out_tokens, time)."""
         
@@ -364,11 +465,11 @@ class Agent:
         try:
             if self.provider == "google":
                 content, in_tok, out_tok = self._stream_google(
-                    conversation_history, placeholder, image_b64
+                    conversation_history, placeholder, image_b64, image_mime
                 )
             else:
                 content, in_tok, out_tok = self._stream_openai_compatible(
-                    conversation_history, placeholder, image_b64
+                    conversation_history, placeholder, image_b64, image_mime
                 )
             
             elapsed = time.time() - start_time
@@ -376,16 +477,15 @@ class Agent:
             
         except Exception as e:
             elapsed = time.time() - start_time
-            error_msg = str(e)
-            # Log error for debugging (won't display to user in production)
-            print(f"Error in {self.name}: {error_msg}")
-            return f"⚠️ Error: {error_msg}", 0, 0, elapsed
+            log_exception(f"Error in {self.name}", e)
+            return get_safe_api_error(self.name), 0, 0, elapsed
 
     def _stream_openai_compatible(
         self, 
         history: List[Dict], 
         placeholder,
-        image_b64: Optional[str] = None
+        image_b64: Optional[str] = None,
+        image_mime: str = "image/jpeg"
     ) -> Tuple[str, int, int]:
         """Stream from OpenAI-compatible API with improved error handling."""
         
@@ -411,12 +511,12 @@ class Agent:
                     {"type": "text", "text": text_content},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
+                        "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}
                     }
                 ]
 
         try:
-            client = get_openai_client(self.api_key, self.config.get("base_url"))
+            client = get_openai_client(self.api_key, self.config.get("base_url"), self.request_timeout)
             
             stream = client.chat.completions.create(
                 model=self.model_id,
@@ -450,20 +550,23 @@ class Agent:
                 return "⚠️ Invalid API key.", 0, 0
             elif "quota" in error_msg or "insufficient" in error_msg:
                 return "⚠️ API quota exceeded. Check your billing.", 0, 0
-            return f"⚠️ API Error: {str(e)}", 0, 0
+            log_exception(f"{self.name} API error", e)
+            return get_safe_api_error(self.name), 0, 0
 
     def _stream_google(
         self, 
         history: List[Dict], 
         placeholder,
-        image_b64: Optional[str] = None
+        image_b64: Optional[str] = None,
+        image_mime: str = "image/jpeg"
     ) -> Tuple[str, int, int]:
         """Stream from Google Gemini API with improved fallback handling."""
         
         try:
             genai.configure(api_key=self.api_key)
         except Exception as e:
-            return f"⚠️ Failed to configure Google API: {str(e)}", 0, 0
+            log_exception(f"{self.name} Google configuration error", e)
+            return get_safe_api_error(self.name), 0, 0
         
         generation_config = genai.types.GenerationConfig(
             max_output_tokens=2048,
@@ -477,7 +580,8 @@ class Agent:
                 generation_config=generation_config
             )
         except Exception as e:
-            return f"⚠️ Failed to initialize model: {str(e)}", 0, 0
+            log_exception(f"{self.name} Google model initialization error", e)
+            return get_safe_api_error(self.name), 0, 0
         
         # Build Google-formatted history
         google_history = []
@@ -492,18 +596,13 @@ class Agent:
                 if google_history[i]["role"] == "user":
                     google_history[i]["parts"].append({
                         "inline_data": {
-                            "mime_type": "image/jpeg",
+                            "mime_type": image_mime,
                             "data": image_b64
                         }
                     })
                     break
 
-        safety_settings = {
-            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-        }
+        safety_settings = build_gemini_safety_settings(self.gemini_safety_mode)
         
         # Try streaming first
         try:
@@ -565,7 +664,8 @@ class Agent:
                     google_history, safety_settings, placeholder, str(e)
                 )
             
-            return f"⚠️ Google API Error: {str(e)}", 0, 0
+            log_exception(f"{self.name} Google API error", e)
+            return get_safe_api_error(self.name), 0, 0
 
     def _call_google_non_streaming(
         self,
@@ -676,13 +776,20 @@ class Agent:
             except Exception:
                 continue
         
-        return f"⚠️ Model not found: {original_error}", 0, 0
+        print(f"Gemini model fallback failed. Original error: {original_error}")
+        return get_safe_api_error(self.name), 0, 0
 
 
 # --- 6. SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuration")
-    
+
+    st.session_state.conversation_title = st.text_input(
+        "Conversation title",
+        value=st.session_state.get("conversation_title", "Untitled Chat"),
+        help="Used in Markdown/JSON exports."
+    )
+
     # Model selection
     selected_models = st.multiselect(
         "Select Participants:",
@@ -710,6 +817,29 @@ with st.sidebar:
         value=False, 
         help="Models respond to each other after initial response"
     )
+
+    judge_mode = st.checkbox(
+        "⚖️ Judge Mode",
+        value=False,
+        help="Ask one model to compare the responses and produce a combined assessment"
+    )
+
+    judge_model_name = None
+    if judge_mode and selected_models:
+        judge_model_name = st.selectbox(
+            "Judge model",
+            options=selected_models,
+            index=0,
+            help="The selected model will evaluate the latest model responses."
+        )
+
+    history_choice = st.selectbox(
+        "Conversation memory",
+        options=list(HISTORY_LIMIT_OPTIONS.keys()),
+        index=2,
+        help="Limit how much chat history is sent to providers. This can reduce cost, latency, and context-limit errors."
+    )
+    history_limit = HISTORY_LIMIT_OPTIONS[history_choice]
     
     temperature = st.slider(
         "Temperature",
@@ -718,6 +848,22 @@ with st.sidebar:
         value=0.7,
         step=0.1,
         help="Higher = more creative, Lower = more focused"
+    )
+
+    request_timeout = st.slider(
+        "Provider timeout, seconds",
+        min_value=10,
+        max_value=180,
+        value=60,
+        step=10,
+        help="Applied to OpenAI-compatible providers. Gemini streaming may use the Google SDK defaults."
+    )
+
+    gemini_safety_mode = st.selectbox(
+        "Gemini safety mode",
+        options=GEMINI_SAFETY_MODES,
+        index=0,
+        help="Default uses Google's default safety behavior. Relaxed blocks only high-confidence harms. Block none matches the prior app behavior."
     )
     
     # Prompt Templates
@@ -733,6 +879,16 @@ with st.sidebar:
     # Custom System Prompts
     with st.expander("🎛️ Custom System Prompts"):
         st.caption("Customize each model's personality")
+        preset_name = st.selectbox("Preset", options=list(SYSTEM_PROMPT_PRESETS.keys()))
+        if st.button("Apply preset to selected models", use_container_width=True):
+            preset_prompt = SYSTEM_PROMPT_PRESETS[preset_name]
+            for model_name in selected_models:
+                if preset_prompt is None:
+                    st.session_state.custom_prompts[model_name] = AVAILABLE_MODELS[model_name]["default_system_prompt"]
+                else:
+                    st.session_state.custom_prompts[model_name] = preset_prompt
+            st.rerun()
+
         for model_name in selected_models:
             new_prompt = st.text_area(
                 f"{AVAILABLE_MODELS[model_name]['icon']} {model_name}",
@@ -757,11 +913,15 @@ with st.sidebar:
     if uploaded_file:
         st.session_state.uploaded_image = uploaded_file
         st.session_state.uploaded_image_b64 = encode_image_to_base64(uploaded_file)
-        st.image(uploaded_file, width=150, caption=uploaded_file.name)
+        st.session_state.uploaded_image_mime = safe_get_image_mime_type(uploaded_file)
+        st.image(uploaded_file, width=150, caption=f"{uploaded_file.name} · {st.session_state.uploaded_image_mime}")
         if st.button("🗑️ Remove Image", use_container_width=True):
             st.session_state.uploaded_image = None
             st.session_state.uploaded_image_b64 = None
+            st.session_state.uploaded_image_mime = None
             st.rerun()
+    elif st.session_state.get("uploaded_image"):
+        st.caption(f"Image ready · {st.session_state.get('uploaded_image_mime', 'image/jpeg')}")
     
     # API Keys Input
     user_api_keys: Dict[str, str] = {}
@@ -786,6 +946,15 @@ with st.sidebar:
                 for m_name in selected_models:
                     if AVAILABLE_MODELS[m_name]["api_key_name"] == key_name:
                         user_api_keys[m_name] = user_input
+
+    if selected_models:
+        with st.expander("🧪 Model readiness", expanded=False):
+            for model_name in selected_models:
+                cfg = AVAILABLE_MODELS[model_name]
+                ready = model_has_api_key(model_name, user_api_keys)
+                vision = "vision" if cfg.get("supports_vision") else "text-only"
+                status = "🟢 ready" if ready else f"🔴 missing {cfg['api_key_name']}"
+                st.caption(f"{cfg['icon']} **{model_name}** · {status} · {vision}")
     
     with st.expander("ℹ️ Get API Keys"):
         st.markdown("""
@@ -799,8 +968,9 @@ with st.sidebar:
     st.divider()
     st.subheader("📊 Stats")
     col_cost, col_tok = st.columns(2)
-    col_cost.metric("Cost", f"${st.session_state.session_cost:.4f}")
+    col_cost.metric("Estimated Cost", f"${st.session_state.session_cost:.4f}")
     col_tok.metric("Tokens", f"{st.session_state.total_tokens:,}")
+    st.caption("Token/cost values are exact when providers return usage and estimated when streaming usage is unavailable.")
     
     # Export
     st.divider()
@@ -843,6 +1013,7 @@ with st.sidebar:
         st.session_state.total_tokens = 0
         st.session_state.uploaded_image = None
         st.session_state.uploaded_image_b64 = None
+        st.session_state.uploaded_image_mime = None
         st.rerun()
         
     if col2.button("🚪 Logout", use_container_width=True):
@@ -853,18 +1024,30 @@ with st.sidebar:
 
 # --- 7. MAIN CHAT INTERFACE ---
 
+def retry_message(message_id: int, agent_name: str):
+    """Retry a response by truncating the conversation back to the context that produced it."""
+    for i, msg in enumerate(st.session_state.messages):
+        if msg.get("id") == message_id:
+            st.session_state.messages = st.session_state.messages[:i]
+            st.session_state["retry_agent"] = agent_name
+            st.rerun()
+    st.warning("Could not find the selected response to retry.")
+
+
 # Create agents for selected models
 active_agents: List[Agent] = []
 for name in selected_models:
     user_key = user_api_keys.get(name)
     custom_prompt = st.session_state.custom_prompts.get(name)
     agent = Agent(
-        name, 
-        AVAILABLE_MODELS[name], 
-        user_key, 
+        name,
+        AVAILABLE_MODELS[name],
+        user_key,
         concise_mode,
         temperature,
-        custom_prompt
+        custom_prompt,
+        gemini_safety_mode,
+        request_timeout
     )
     active_agents.append(agent)
 
@@ -873,33 +1056,59 @@ for i, message in enumerate(st.session_state.messages):
     avatar = message.get("avatar", "👤" if message["role"] == "user" else "🤖")
     
     with st.chat_message(message["role"], avatar=avatar):
-        col_msg, col_meta = st.columns([0.85, 0.15])
+        col_msg, col_meta = st.columns([0.82, 0.18])
         
         with col_msg:
-            st.markdown(f"**{message['name']}**: {message['content']}")
+            label = "Judge" if message.get("is_judge") else message.get("name", "Unknown")
+            st.markdown(f"**{label}**: {message.get('content', '')}")
+            if message["role"] == "assistant":
+                with st.expander("📋 Copy response", expanded=False):
+                    st.text_area(
+                        "Response text",
+                        value=message.get("content", ""),
+                        height=160,
+                        key=f"copy_{message.get('id', i)}",
+                        label_visibility="collapsed"
+                    )
         
         with col_meta:
-            # Show response time for assistant messages
-            if message["role"] == "assistant" and message.get("response_time"):
-                st.caption(f"⏱️ {message['response_time']:.1f}s")
-            
-            # Show debate indicator
-            if message.get("is_debate"):
-                st.caption("🔄")
-
-# --- RETRY FUNCTION ---
-def retry_message(message_id: int, agent_name: str):
-    """Retry generating a response for a specific message."""
-    # Find and remove the message to retry
-    for i, msg in enumerate(st.session_state.messages):
-        if msg.get("id") == message_id:
-            st.session_state.messages.pop(i)
-            break
-    st.session_state["retry_agent"] = agent_name
-    st.rerun()
+            if message["role"] == "assistant":
+                if message.get("response_time"):
+                    st.caption(f"⏱️ {message['response_time']:.1f}s")
+                if message.get("input_tokens") is not None and message.get("output_tokens") is not None:
+                    st.caption(f"🔢 {message.get('input_tokens', 0):,}/{message.get('output_tokens', 0):,}")
+                if message.get("estimated_cost") is not None:
+                    st.caption(f"💵 ${message.get('estimated_cost', 0.0):.5f}")
+                if message.get("is_debate"):
+                    st.caption("🔄 Debate")
+                if message.get("is_judge"):
+                    st.caption("⚖️ Judge")
+                if st.button("🔄", key=f"retry_hist_{message.get('id', i)}", help="Retry this response"):
+                    retry_message(message.get("id"), message.get("name"))
 
 # Check for pending retry
 retry_agent_name = st.session_state.pop("retry_agent", None)
+
+if retry_agent_name:
+    agent = next((a for a in active_agents if a.name == retry_agent_name), None)
+    if agent:
+        with st.chat_message("assistant", avatar=agent.avatar):
+            placeholder = st.empty()
+            placeholder.markdown(f"**{agent.name}**: *retrying...*")
+            
+            content, in_tok, out_tok, elapsed = agent.generate_response_streaming(
+                get_limited_history(st.session_state.messages, history_limit),
+                placeholder,
+                None,
+                "image/jpeg"
+            )
+            
+            msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok)
+            st.caption(f"⏱️ {elapsed:.1f}s (retry)")
+        
+        st.rerun()
+    else:
+        st.warning(f"Could not retry because {retry_agent_name} is not currently selected.")
 
 # Process chat input
 placeholder_text = "Type your message..." if active_agents else "← Select models first"
@@ -932,6 +1141,8 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
     
     # Get image if uploaded
     image_b64 = st.session_state.get("uploaded_image_b64")
+    image_mime = st.session_state.get("uploaded_image_mime") or "image/jpeg"
+    initial_response_records: List[Dict[str, str]] = []
 
     # --- SIDE BY SIDE MODE ---
     if side_by_side and len(responders) > 1:
@@ -944,26 +1155,15 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                     placeholder.markdown(f"**{agent.name}**: *thinking...*")
                     
                     content, in_tok, out_tok, elapsed = agent.generate_response_streaming(
-                        st.session_state.messages,
+                        get_limited_history(st.session_state.messages, history_limit),
                         placeholder,
-                        image_b64 if agent.supports_vision else None
+                        image_b64 if agent.supports_vision else None,
+                        image_mime
                     )
                     
-                    msg_id = get_next_message_id()
-                    st.session_state.messages.append({
-                        "id": msg_id,
-                        "role": "assistant", 
-                        "name": agent.name, 
-                        "content": content, 
-                        "avatar": agent.avatar,
-                        "response_time": elapsed
-                    })
-                    
+                    msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok)
+                    initial_response_records.append({"name": agent.name, "content": content})
                     st.caption(f"⏱️ {elapsed:.1f}s")
-                    
-                    cost = calculate_cost(agent.name, in_tok, out_tok)
-                    st.session_state.session_cost += cost
-                    st.session_state.total_tokens += (in_tok + out_tok)
     
     # --- STANDARD MODE ---
     else:
@@ -973,102 +1173,79 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                 placeholder.markdown(f"**{agent.name}**: *thinking...*")
                 
                 content, in_tok, out_tok, elapsed = agent.generate_response_streaming(
-                    st.session_state.messages,
+                    get_limited_history(st.session_state.messages, history_limit),
                     placeholder,
-                    image_b64 if agent.supports_vision else None
+                    image_b64 if agent.supports_vision else None,
+                    image_mime
                 )
                 
-                msg_id = get_next_message_id()
-                st.session_state.messages.append({
-                    "id": msg_id,
-                    "role": "assistant", 
-                    "name": agent.name, 
-                    "content": content, 
-                    "avatar": agent.avatar,
-                    "response_time": elapsed
-                })
+                msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok)
+                initial_response_records.append({"name": agent.name, "content": content})
                 
-                # Show timing and retry button
                 col_time, col_retry = st.columns([0.8, 0.2])
                 with col_time:
                     st.caption(f"⏱️ {elapsed:.1f}s")
                 with col_retry:
                     if st.button("🔄", key=f"retry_{msg_id}", help="Retry this response"):
                         retry_message(msg_id, agent.name)
-                
-                cost = calculate_cost(agent.name, in_tok, out_tok)
-                st.session_state.session_cost += cost
-                st.session_state.total_tokens += (in_tok + out_tok)
     
     # --- DEBATE MODE ---
     if debate_mode and len(responders) > 1:
         st.divider()
         st.markdown("### 🔄 Debate Round")
         
-        # Each model responds to the previous responses
         for agent in responders:
             with st.chat_message("assistant", avatar=agent.avatar):
                 placeholder = st.empty()
                 placeholder.markdown(f"**{agent.name}** *(responding to others)*: *thinking...*")
                 
                 content, in_tok, out_tok, elapsed = agent.generate_response_streaming(
-                    st.session_state.messages,
+                    get_limited_history(st.session_state.messages, history_limit),
                     placeholder,
-                    None  # No image in debate round
+                    None,
+                    "image/jpeg"
                 )
                 
-                msg_id = get_next_message_id()
-                st.session_state.messages.append({
-                    "id": msg_id,
-                    "role": "assistant", 
-                    "name": agent.name, 
-                    "content": content, 
-                    "avatar": agent.avatar,
-                    "response_time": elapsed,
-                    "is_debate": True
-                })
-                
+                add_assistant_message(agent, content, elapsed, in_tok, out_tok, is_debate=True)
                 st.caption(f"⏱️ {elapsed:.1f}s • Debate Round")
-                
-                cost = calculate_cost(agent.name, in_tok, out_tok)
-                st.session_state.session_cost += cost
-                st.session_state.total_tokens += (in_tok + out_tok)
+
+    # --- JUDGE MODE ---
+    if judge_mode and judge_model_name and len(initial_response_records) > 1:
+        judge_agent = next((a for a in active_agents if a.name == judge_model_name), None)
+        if judge_agent:
+            st.divider()
+            st.markdown("### ⚖️ Judge Assessment")
+            comparison_text = "\n\n".join(
+                f"### {item['name']}\n{item['content']}" for item in initial_response_records
+            )
+            judge_prompt = (
+                "Compare the model responses below. Identify the strongest answer, factual risks, "
+                "missing considerations, and a best combined answer. Be concise and practical.\n\n"
+                f"{comparison_text}"
+            )
+            judge_history = get_limited_history(st.session_state.messages, history_limit) + [{
+                "id": get_next_message_id(),
+                "role": "user",
+                "name": "User",
+                "content": judge_prompt,
+                "avatar": "👤"
+            }]
+            with st.chat_message("assistant", avatar=judge_agent.avatar):
+                placeholder = st.empty()
+                placeholder.markdown(f"**{judge_agent.name} Judge**: *reviewing responses...*")
+                content, in_tok, out_tok, elapsed = judge_agent.generate_response_streaming(
+                    judge_history,
+                    placeholder,
+                    None,
+                    "image/jpeg"
+                )
+                add_assistant_message(judge_agent, content, elapsed, in_tok, out_tok, is_judge=True)
+                st.caption(f"⏱️ {elapsed:.1f}s • Judge Mode")
     
     # Clear image after use
     if image_b64:
         st.session_state.uploaded_image = None
         st.session_state.uploaded_image_b64 = None
+        st.session_state.uploaded_image_mime = None
     
     st.rerun()
-
-# Handle retry if pending
-if retry_agent_name:
-    agent = next((a for a in active_agents if a.name == retry_agent_name), None)
-    if agent:
-        with st.chat_message("assistant", avatar=agent.avatar):
-            placeholder = st.empty()
-            placeholder.markdown(f"**{agent.name}**: *retrying...*")
-            
-            content, in_tok, out_tok, elapsed = agent.generate_response_streaming(
-                st.session_state.messages,
-                placeholder,
-                None
-            )
-            
-            msg_id = get_next_message_id()
-            st.session_state.messages.append({
-                "id": msg_id,
-                "role": "assistant", 
-                "name": agent.name, 
-                "content": content, 
-                "avatar": agent.avatar,
-                "response_time": elapsed
-            })
-            
-            st.caption(f"⏱️ {elapsed:.1f}s (retry)")
-            
-            cost = calculate_cost(agent.name, in_tok, out_tok)
-            st.session_state.session_cost += cost
-            st.session_state.total_tokens += (in_tok + out_tok)
-        
-        st.rerun()
