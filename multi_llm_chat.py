@@ -10,6 +10,7 @@ import google.generativeai as genai
 import base64
 import traceback
 from pathlib import Path
+import pandas as pd
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Multi-LLM Chat", page_icon="🤖", layout="wide")
@@ -109,13 +110,138 @@ def init_session_state():
         "uploaded_image_b64": None,
         "uploaded_image_mime": None,
         "password_correct": None,
-        "conversation_title": "Untitled Chat"
+        "conversation_title": "Untitled Chat",
+        "ad_hoc_model_configs": {},
+        "ad_hoc_api_keys": {},
+        "response_batches": [],
+        "last_batch_id": 0
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 init_session_state()
+
+APP_VERSION = "v3-model-lab"
+
+
+def ensure_v3_state() -> None:
+    """Initialize v3-specific state safely for existing deployments."""
+    st.session_state.setdefault("ad_hoc_model_configs", {})
+    st.session_state.setdefault("ad_hoc_api_keys", {})
+    st.session_state.setdefault("response_batches", [])
+    st.session_state.setdefault("last_batch_id", 0)
+
+
+ensure_v3_state()
+
+
+def slugify_model_name(name: str) -> str:
+    """Create a safe stable suffix for dynamic/ad-hoc model config keys."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", name.strip()).strip("_").upper()
+    return slug or "ADHOC_MODEL"
+
+
+def normalize_model_config(name: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure every static or ad-hoc model has the fields the app expects."""
+    cfg = dict(config)
+    cfg.setdefault("display_name", name)
+    cfg.setdefault("api_id", name)
+    cfg.setdefault("provider", "openai_compatible")
+    cfg.setdefault("base_url", None)
+    cfg.setdefault("api_key_name", f"ADHOC_{slugify_model_name(name)}_API_KEY")
+    cfg.setdefault("price_input", 0.0)
+    cfg.setdefault("price_output", 0.0)
+    cfg.setdefault("icon", "🧪")
+    if "family" not in cfg:
+        if cfg.get("provider") == "google":
+            cfg["family"] = "Gemini"
+        elif "grok" in name.lower():
+            cfg["family"] = "Grok"
+        elif "deepseek" in name.lower():
+            cfg["family"] = "DeepSeek"
+        elif "gpt" in name.lower() or cfg.get("provider") == "openai":
+            cfg["family"] = "OpenAI"
+        else:
+            cfg["family"] = "Ad-hoc"
+    cfg.setdefault("generation", "current" if not cfg.get("is_ad_hoc") else "custom")
+    cfg.setdefault("default_system_prompt", f"You are {name}, a helpful AI assistant.")
+    cfg.setdefault("mention_triggers", [slugify_model_name(name).lower()])
+    cfg.setdefault("supports_vision", False)
+    cfg.setdefault("is_ad_hoc", False)
+    return cfg
+
+
+def get_available_models() -> Dict[str, Dict[str, Any]]:
+    """Return the active model registry, including session-added ad-hoc models."""
+    registry = {name: normalize_model_config(name, cfg) for name, cfg in AVAILABLE_MODELS.items()}
+    for name, cfg in st.session_state.get("ad_hoc_model_configs", {}).items():
+        registry[name] = normalize_model_config(name, cfg)
+    return registry
+
+
+def get_model_config(model_name: str) -> Dict[str, Any]:
+    """Fetch config from the live registry."""
+    return get_available_models()[model_name]
+
+
+def get_model_identity_label(model_name: str) -> str:
+    """Human-readable identity line for UI/debug/export."""
+    cfg = get_model_config(model_name)
+    base = cfg.get("base_url") or "default provider endpoint"
+    return f"{cfg.get('display_name', model_name)} → {cfg.get('api_id')} · {cfg.get('provider')} · {base}"
+
+
+def next_batch_id() -> int:
+    st.session_state.last_batch_id = int(st.session_state.get("last_batch_id", 0)) + 1
+    return st.session_state.last_batch_id
+
+
+def is_error_content(content: str) -> bool:
+    return str(content or "").strip().startswith("⚠️")
+
+
+def summarize_response_rows(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Rows for the comparison table."""
+    rows = []
+    for item in batch.get("responses", []):
+        text = item.get("content", "") or ""
+        rows.append({
+            "Model": item.get("name", "Unknown"),
+            "Status": "Failed" if item.get("is_error") else "OK",
+            "Model ID": item.get("model_id", ""),
+            "Provider": item.get("provider", ""),
+            "Time (s)": round(float(item.get("response_time") or 0), 2),
+            "Tokens In": int(item.get("input_tokens") or 0),
+            "Tokens Out": int(item.get("output_tokens") or 0),
+            "Cost": round(float(item.get("estimated_cost") or 0), 6),
+            "Chars": len(text),
+            "Preview": text.replace("\n", " ")[:160]
+        })
+    return rows
+
+
+def compute_model_performance(messages: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Aggregate model performance from assistant messages in this session."""
+    records = []
+    for msg in messages:
+        if msg.get("role") != "assistant" or msg.get("is_judge"):
+            continue
+        records.append({
+            "Model": msg.get("name", "Unknown"),
+            "Calls": 1,
+            "Failures": 1 if msg.get("is_error") else 0,
+            "Total Seconds": float(msg.get("response_time") or 0),
+            "Tokens": int(msg.get("input_tokens") or 0) + int(msg.get("output_tokens") or 0),
+            "Cost": float(msg.get("estimated_cost") or 0),
+        })
+    if not records:
+        return pd.DataFrame(columns=["Model", "Calls", "Failures", "Failure Rate", "Avg Seconds", "Tokens", "Cost"])
+    df = pd.DataFrame(records).groupby("Model", as_index=False).sum(numeric_only=True)
+    df["Failure Rate"] = (df["Failures"] / df["Calls"]).round(3)
+    df["Avg Seconds"] = (df["Total Seconds"] / df["Calls"]).round(2)
+    df["Cost"] = df["Cost"].round(6)
+    return df[["Model", "Calls", "Failures", "Failure Rate", "Avg Seconds", "Tokens", "Cost"]]
 
 # --- 3. AUTHENTICATION ---
 def check_password() -> bool:
@@ -191,9 +317,10 @@ def get_api_key(key_name: str, user_provided_key: Optional[str] = None) -> Optio
 
 def calculate_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
     """Calculate API cost based on token usage."""
-    if model_name not in AVAILABLE_MODELS:
+    registry = get_available_models()
+    if model_name not in registry:
         return 0.0
-    info = AVAILABLE_MODELS[model_name]
+    info = registry[model_name]
     in_cost = (input_tokens / 1_000_000) * info["price_input"]
     out_cost = (output_tokens / 1_000_000) * info["price_output"]
     return in_cost + out_cost
@@ -260,6 +387,9 @@ def export_chat_json() -> str:
         "exported_at": datetime.now().isoformat(),
         "session_cost": st.session_state.session_cost,
         "total_tokens": st.session_state.total_tokens,
+        "app_version": APP_VERSION,
+        "model_registry": {name: {k: v for k, v in cfg.items() if k != "api_key"} for name, cfg in get_available_models().items()},
+        "response_batches": st.session_state.get("response_batches", []),
         "messages": st.session_state.messages
     }
     return json.dumps(export_data, indent=2)
@@ -331,11 +461,14 @@ def build_gemini_safety_settings(mode: str) -> Optional[Dict[str, str]]:
 
 def model_has_api_key(model_name: str, user_keys: Dict[str, str]) -> bool:
     """Check whether a selected model has a key from secrets or sidebar input."""
-    key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
+    cfg = get_model_config(model_name)
+    key_name = cfg["api_key_name"]
+    if cfg.get("is_ad_hoc") and st.session_state.get("ad_hoc_api_keys", {}).get(model_name):
+        return True
     return bool(user_keys.get(model_name) or st.secrets.get(key_name))
 
 
-def add_assistant_message(agent: 'Agent', content: str, elapsed: float, in_tok: int, out_tok: int, *, is_debate: bool = False, is_judge: bool = False) -> int:
+def add_assistant_message(agent: 'Agent', content: str, elapsed: float, in_tok: int, out_tok: int, *, is_debate: bool = False, is_judge: bool = False, batch_id: Optional[int] = None) -> int:
     """Append an assistant message with export-friendly metadata."""
     cost = calculate_cost(agent.name, in_tok, out_tok)
     msg_id = get_next_message_id()
@@ -348,11 +481,17 @@ def add_assistant_message(agent: 'Agent', content: str, elapsed: float, in_tok: 
         "response_time": elapsed,
         "provider": agent.provider,
         "model_id": agent.model_id,
+        "display_name": agent.config.get("display_name", agent.name),
+        "base_url": agent.config.get("base_url"),
+        "family": agent.config.get("family", ""),
+        "generation": agent.config.get("generation", ""),
         "input_tokens": in_tok,
         "output_tokens": out_tok,
         "estimated_cost": cost,
         "is_debate": is_debate,
         "is_judge": is_judge,
+        "is_error": is_error_content(content),
+        "batch_id": batch_id,
     })
     st.session_state.session_cost += cost
     st.session_state.total_tokens += (in_tok + out_tok)
@@ -417,7 +556,7 @@ class Agent:
         
         # Build pattern for known AI names
         escaped_names = [re.escape(name) for name in self.KNOWN_AI_NAMES]
-        escaped_names.extend([re.escape(name) for name in AVAILABLE_MODELS.keys()])
+        escaped_names.extend([re.escape(name) for name in get_available_models().keys()])
         names_pattern = "|".join(escaped_names)
         
         # Remove leading identity markers
@@ -790,11 +929,62 @@ with st.sidebar:
         help="Used in Markdown/JSON exports."
     )
 
+    with st.expander("🧪 Add ad-hoc OpenAI-compatible model", expanded=False):
+        st.caption("Use this for OpenAI-compatible providers such as OpenRouter, Together, Fireworks, local gateways, or custom endpoints. Keys are stored only in this Streamlit session unless you add them to secrets.")
+        adhoc_name = st.text_input("Display name", placeholder="My Custom Model", key="adhoc_display_name")
+        adhoc_model_id = st.text_input("API model ID", placeholder="provider/model-id", key="adhoc_model_id")
+        adhoc_base_url = st.text_input("Base URL", placeholder="https://api.example.com/v1", key="adhoc_base_url")
+        adhoc_key_name = st.text_input("Optional Streamlit secret name", placeholder="MY_PROVIDER_API_KEY", key="adhoc_key_name")
+        adhoc_api_key = st.text_input("API key for this session", type="password", key="adhoc_api_key")
+        adhoc_icon = st.text_input("Icon", value="🧪", max_chars=2, key="adhoc_icon")
+        adhoc_supports_vision = st.checkbox("Supports OpenAI-style vision messages", value=False, key="adhoc_vision")
+        col_price1, col_price2 = st.columns(2)
+        with col_price1:
+            adhoc_price_in = st.number_input("$/1M input", min_value=0.0, value=0.0, step=0.01, key="adhoc_price_in")
+        with col_price2:
+            adhoc_price_out = st.number_input("$/1M output", min_value=0.0, value=0.0, step=0.01, key="adhoc_price_out")
+        if st.button("Add/update ad-hoc model", use_container_width=True):
+            if not adhoc_name.strip() or not adhoc_model_id.strip():
+                st.warning("Display name and API model ID are required.")
+            else:
+                key_name = adhoc_key_name.strip() or f"ADHOC_{slugify_model_name(adhoc_name)}_API_KEY"
+                st.session_state.ad_hoc_model_configs[adhoc_name.strip()] = {
+                    "display_name": adhoc_name.strip(),
+                    "api_id": adhoc_model_id.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": adhoc_base_url.strip() or None,
+                    "api_key_name": key_name,
+                    "price_input": float(adhoc_price_in),
+                    "price_output": float(adhoc_price_out),
+                    "icon": adhoc_icon or "🧪",
+                    "family": "Ad-hoc",
+                    "generation": "custom",
+                    "default_system_prompt": f"You are {adhoc_name.strip()}, a helpful AI assistant.",
+                    "mention_triggers": [slugify_model_name(adhoc_name).lower(), adhoc_name.lower().replace(" ", "")],
+                    "supports_vision": bool(adhoc_supports_vision),
+                    "is_ad_hoc": True,
+                }
+                if adhoc_api_key:
+                    st.session_state.ad_hoc_api_keys[adhoc_name.strip()] = adhoc_api_key
+                st.success(f"Added {adhoc_name.strip()}.")
+                st.rerun()
+        if st.session_state.get("ad_hoc_model_configs"):
+            st.caption("Current ad-hoc models:")
+            for adhoc_existing in list(st.session_state.ad_hoc_model_configs.keys()):
+                c_name, c_remove = st.columns([0.72, 0.28])
+                c_name.caption(adhoc_existing)
+                if c_remove.button("Remove", key=f"remove_adhoc_{adhoc_existing}"):
+                    st.session_state.ad_hoc_model_configs.pop(adhoc_existing, None)
+                    st.session_state.ad_hoc_api_keys.pop(adhoc_existing, None)
+                    st.rerun()
+
+    all_models = get_available_models()
+
     # Model selection
     selected_models = st.multiselect(
         "Select Participants:",
-        options=list(AVAILABLE_MODELS.keys()),
-        default=["GPT-4o", "Grok-3"],
+        options=list(all_models.keys()),
+        default=[m for m in ["GPT-4o", "Grok-3"] if m in all_models],
         help="Choose which AI models will participate"
     )
     
@@ -884,17 +1074,17 @@ with st.sidebar:
             preset_prompt = SYSTEM_PROMPT_PRESETS[preset_name]
             for model_name in selected_models:
                 if preset_prompt is None:
-                    st.session_state.custom_prompts[model_name] = AVAILABLE_MODELS[model_name]["default_system_prompt"]
+                    st.session_state.custom_prompts[model_name] = all_models[model_name]["default_system_prompt"]
                 else:
                     st.session_state.custom_prompts[model_name] = preset_prompt
             st.rerun()
 
         for model_name in selected_models:
             new_prompt = st.text_area(
-                f"{AVAILABLE_MODELS[model_name]['icon']} {model_name}",
+                f"{all_models[model_name]['icon']} {model_name}",
                 value=st.session_state.custom_prompts.get(
                     model_name, 
-                    AVAILABLE_MODELS[model_name]["default_system_prompt"]
+                    all_models[model_name]["default_system_prompt"]
                 ),
                 height=80,
                 key=f"prompt_{model_name}"
@@ -924,12 +1114,13 @@ with st.sidebar:
         st.caption(f"Image ready · {st.session_state.get('uploaded_image_mime', 'image/jpeg')}")
     
     # API Keys Input
-    user_api_keys: Dict[str, str] = {}
+    user_api_keys: Dict[str, str] = dict(st.session_state.get("ad_hoc_api_keys", {}))
     missing_keys_info: List[Tuple[str, str]] = []
     
     for model_name in selected_models:
-        key_name = AVAILABLE_MODELS[model_name]["api_key_name"]
-        if key_name not in st.secrets:
+        key_name = all_models[model_name]["api_key_name"]
+        has_session_key = bool(st.session_state.get("ad_hoc_api_keys", {}).get(model_name))
+        if key_name not in st.secrets and not has_session_key:
             if not any(k == key_name for _, k in missing_keys_info):
                 missing_keys_info.append((model_name, key_name))
 
@@ -944,17 +1135,18 @@ with st.sidebar:
             )
             if user_input:
                 for m_name in selected_models:
-                    if AVAILABLE_MODELS[m_name]["api_key_name"] == key_name:
+                    if all_models[m_name]["api_key_name"] == key_name:
                         user_api_keys[m_name] = user_input
 
     if selected_models:
         with st.expander("🧪 Model readiness", expanded=False):
             for model_name in selected_models:
-                cfg = AVAILABLE_MODELS[model_name]
+                cfg = all_models[model_name]
                 ready = model_has_api_key(model_name, user_api_keys)
                 vision = "vision" if cfg.get("supports_vision") else "text-only"
                 status = "🟢 ready" if ready else f"🔴 missing {cfg['api_key_name']}"
                 st.caption(f"{cfg['icon']} **{model_name}** · {status} · {vision}")
+                st.caption(f"↳ `{cfg.get('api_id')}` · `{cfg.get('provider')}`")
     
     with st.expander("ℹ️ Get API Keys"):
         st.markdown("""
@@ -971,6 +1163,12 @@ with st.sidebar:
     col_cost.metric("Estimated Cost", f"${st.session_state.session_cost:.4f}")
     col_tok.metric("Tokens", f"{st.session_state.total_tokens:,}")
     st.caption("Token/cost values are exact when providers return usage and estimated when streaming usage is unavailable.")
+    with st.expander("📈 Model performance", expanded=False):
+        perf_df = compute_model_performance(st.session_state.messages)
+        if perf_df.empty:
+            st.caption("No model calls yet.")
+        else:
+            st.dataframe(perf_df, use_container_width=True, hide_index=True)
     
     # Export
     st.divider()
@@ -1011,6 +1209,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.session_cost = 0.0
         st.session_state.total_tokens = 0
+        st.session_state.response_batches = []
+        st.session_state.last_batch_id = 0
         st.session_state.uploaded_image = None
         st.session_state.uploaded_image_b64 = None
         st.session_state.uploaded_image_mime = None
@@ -1041,7 +1241,7 @@ for name in selected_models:
     custom_prompt = st.session_state.custom_prompts.get(name)
     agent = Agent(
         name,
-        AVAILABLE_MODELS[name],
+        get_model_config(name),
         user_key,
         concise_mode,
         temperature,
@@ -1050,6 +1250,48 @@ for name in selected_models:
         request_timeout
     )
     active_agents.append(agent)
+
+# Latest comparison and synthesis tools
+if st.session_state.get("response_batches"):
+    latest_batch = st.session_state.response_batches[-1]
+    latest_rows = summarize_response_rows(latest_batch)
+    with st.expander("📊 Latest response comparison", expanded=False):
+        st.caption(f"Prompt: {latest_batch.get('prompt', '')[:240]}")
+        if latest_rows:
+            st.dataframe(pd.DataFrame(latest_rows), use_container_width=True, hide_index=True)
+        synth_candidates = [a.name for a in active_agents]
+        if synth_candidates:
+            synth_model = st.selectbox("Synthesis model", options=synth_candidates, key="synthesis_model_select")
+            if st.button("✨ Synthesize latest responses", use_container_width=True):
+                st.session_state["pending_synthesis"] = {"batch_id": latest_batch.get("batch_id"), "model": synth_model}
+                st.rerun()
+
+pending_synthesis = st.session_state.pop("pending_synthesis", None)
+if pending_synthesis:
+    target_batch = next((b for b in st.session_state.get("response_batches", []) if b.get("batch_id") == pending_synthesis.get("batch_id")), None)
+    synth_agent = next((a for a in active_agents if a.name == pending_synthesis.get("model")), None)
+    if target_batch and synth_agent:
+        synthesis_text = "\n\n".join(f"### {r.get('name')}\n{r.get('content')}" for r in target_batch.get("responses", []) if not r.get("is_error"))
+        synthesis_prompt = (
+            "Create one best combined answer from the model responses below. Preserve useful nuance, correct weaknesses, "
+            "avoid inventing facts, and be clear about uncertainty.\n\n" + synthesis_text
+        )
+        synth_history = get_limited_history(st.session_state.messages, history_limit) + [{
+            "id": get_next_message_id(),
+            "role": "user",
+            "name": "User",
+            "content": synthesis_prompt,
+            "avatar": "👤"
+        }]
+        with st.chat_message("assistant", avatar=synth_agent.avatar):
+            placeholder = st.empty()
+            placeholder.markdown(f"**{synth_agent.name} Synthesis**: *combining responses...*")
+            content, in_tok, out_tok, elapsed = synth_agent.generate_response_streaming(synth_history, placeholder, None, "image/jpeg")
+            add_assistant_message(synth_agent, content, elapsed, in_tok, out_tok, is_judge=True, batch_id=target_batch.get("batch_id"))
+            st.caption(f"⏱️ {elapsed:.1f}s • Synthesis")
+        st.rerun()
+    else:
+        st.warning("Could not synthesize because the selected batch or model is no longer available.")
 
 # Display chat history
 for i, message in enumerate(st.session_state.messages):
@@ -1061,7 +1303,7 @@ for i, message in enumerate(st.session_state.messages):
         with col_msg:
             label = "Judge" if message.get("is_judge") else message.get("name", "Unknown")
             st.markdown(f"**{label}**: {message.get('content', '')}")
-            if message["role"] == "assistant":
+            if message["role"] == "assistant" and not message.get("is_error"):
                 with st.expander("📋 Copy response", expanded=False):
                     st.text_area(
                         "Response text",
@@ -1070,9 +1312,13 @@ for i, message in enumerate(st.session_state.messages):
                         key=f"copy_{message.get('id', i)}",
                         label_visibility="collapsed"
                     )
+            elif message["role"] == "assistant" and message.get("is_error"):
+                st.caption("Failure details are available in provider dashboards and Streamlit logs.")
         
         with col_meta:
             if message["role"] == "assistant":
+                if message.get("model_id"):
+                    st.caption(f"🧭 `{message.get('model_id')}`")
                 if message.get("response_time"):
                     st.caption(f"⏱️ {message['response_time']:.1f}s")
                 if message.get("input_tokens") is not None and message.get("output_tokens") is not None:
@@ -1083,7 +1329,7 @@ for i, message in enumerate(st.session_state.messages):
                     st.caption("🔄 Debate")
                 if message.get("is_judge"):
                     st.caption("⚖️ Judge")
-                if st.button("🔄", key=f"retry_hist_{message.get('id', i)}", help="Retry this response"):
+                if not message.get("is_error") and st.button("🔄", key=f"retry_hist_{message.get('id', i)}", help="Retry this response"):
                     retry_message(message.get("id"), message.get("name"))
 
 # Check for pending retry
@@ -1142,7 +1388,8 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
     # Get image if uploaded
     image_b64 = st.session_state.get("uploaded_image_b64")
     image_mime = st.session_state.get("uploaded_image_mime") or "image/jpeg"
-    initial_response_records: List[Dict[str, str]] = []
+    initial_response_records: List[Dict[str, Any]] = []
+    batch_id = next_batch_id()
 
     # --- SIDE BY SIDE MODE ---
     if side_by_side and len(responders) > 1:
@@ -1161,8 +1408,14 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                         image_mime
                     )
                     
-                    msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok)
-                    initial_response_records.append({"name": agent.name, "content": content})
+                    msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok, batch_id=batch_id)
+                    initial_response_records.append({
+                        "name": agent.name, "content": content, "model_id": agent.model_id,
+                        "provider": agent.provider, "response_time": elapsed,
+                        "input_tokens": in_tok, "output_tokens": out_tok,
+                        "estimated_cost": calculate_cost(agent.name, in_tok, out_tok),
+                        "is_error": is_error_content(content)
+                    })
                     st.caption(f"⏱️ {elapsed:.1f}s")
     
     # --- STANDARD MODE ---
@@ -1179,8 +1432,14 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                     image_mime
                 )
                 
-                msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok)
-                initial_response_records.append({"name": agent.name, "content": content})
+                msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok, batch_id=batch_id)
+                initial_response_records.append({
+                    "name": agent.name, "content": content, "model_id": agent.model_id,
+                    "provider": agent.provider, "response_time": elapsed,
+                    "input_tokens": in_tok, "output_tokens": out_tok,
+                    "estimated_cost": calculate_cost(agent.name, in_tok, out_tok),
+                    "is_error": is_error_content(content)
+                })
                 
                 col_time, col_retry = st.columns([0.8, 0.2])
                 with col_time:
@@ -1189,6 +1448,17 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                     if st.button("🔄", key=f"retry_{msg_id}", help="Retry this response"):
                         retry_message(msg_id, agent.name)
     
+    if initial_response_records:
+        st.session_state.response_batches.append({
+            "batch_id": batch_id,
+            "created_at": datetime.now().isoformat(),
+            "prompt": user_input,
+            "responders": [r.get("name") for r in initial_response_records],
+            "responses": initial_response_records,
+        })
+        # Keep session state modest on Streamlit Community Cloud.
+        st.session_state.response_batches = st.session_state.response_batches[-25:]
+
     # --- DEBATE MODE ---
     if debate_mode and len(responders) > 1:
         st.divider()
@@ -1206,7 +1476,7 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                     "image/jpeg"
                 )
                 
-                add_assistant_message(agent, content, elapsed, in_tok, out_tok, is_debate=True)
+                add_assistant_message(agent, content, elapsed, in_tok, out_tok, is_debate=True, batch_id=batch_id)
                 st.caption(f"⏱️ {elapsed:.1f}s • Debate Round")
 
     # --- JUDGE MODE ---
@@ -1239,7 +1509,7 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                     None,
                     "image/jpeg"
                 )
-                add_assistant_message(judge_agent, content, elapsed, in_tok, out_tok, is_judge=True)
+                add_assistant_message(judge_agent, content, elapsed, in_tok, out_tok, is_judge=True, batch_id=batch_id)
                 st.caption(f"⏱️ {elapsed:.1f}s • Judge Mode")
     
     # Clear image after use
