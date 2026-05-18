@@ -114,7 +114,8 @@ def init_session_state():
         "ad_hoc_model_configs": {},
         "ad_hoc_api_keys": {},
         "response_batches": [],
-        "last_batch_id": 0
+        "last_batch_id": 0,
+        "debug_events": []
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -122,7 +123,7 @@ def init_session_state():
 
 init_session_state()
 
-APP_VERSION = "v3-model-lab"
+APP_VERSION = "v4-diagnostics"
 
 
 def ensure_v3_state() -> None:
@@ -131,6 +132,7 @@ def ensure_v3_state() -> None:
     st.session_state.setdefault("ad_hoc_api_keys", {})
     st.session_state.setdefault("response_batches", [])
     st.session_state.setdefault("last_batch_id", 0)
+    st.session_state.setdefault("debug_events", [])
 
 
 ensure_v3_state()
@@ -215,6 +217,9 @@ def summarize_response_rows(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
             "Tokens In": int(item.get("input_tokens") or 0),
             "Tokens Out": int(item.get("output_tokens") or 0),
             "Cost": round(float(item.get("estimated_cost") or 0), 6),
+            "Image Available": bool(item.get("image_available")),
+            "Image Sent": bool(item.get("image_sent")),
+            "Vision": bool(item.get("supports_vision")),
             "Chars": len(text),
             "Preview": text.replace("\n", " ")[:160]
         })
@@ -390,6 +395,7 @@ def export_chat_json() -> str:
         "app_version": APP_VERSION,
         "model_registry": {name: {k: v for k, v in cfg.items() if k != "api_key"} for name, cfg in get_available_models().items()},
         "response_batches": st.session_state.get("response_batches", []),
+        "debug_events": st.session_state.get("debug_events", []),
         "messages": st.session_state.messages
     }
     return json.dumps(export_data, indent=2)
@@ -434,10 +440,71 @@ def get_safe_api_error(provider_name: str = "API") -> str:
     return f"⚠️ {provider_name} request failed. Check the app logs or provider dashboard for details."
 
 
+def categorize_exception(exc: Exception) -> str:
+    """Return a safe, non-secret error category for UI/debug logs."""
+    text = str(exc).lower()
+    if "rate" in text and "limit" in text or "429" in text:
+        return "rate_limit"
+    if "quota" in text or "insufficient" in text or "billing" in text:
+        return "quota_or_billing"
+    if "invalid" in text and "key" in text or "unauthorized" in text or "401" in text:
+        return "auth_invalid_key"
+    if "permission" in text or "blocked" in text or "403" in text:
+        return "auth_permission_or_blocked"
+    if "not found" in text or "404" in text:
+        return "model_or_endpoint_not_found"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "safety" in text or "blocked" in text:
+        return "safety_or_policy_block"
+    return "provider_error"
+
+
+def add_debug_event(
+    event_type: str,
+    *,
+    model_name: Optional[str] = None,
+    provider: Optional[str] = None,
+    model_id: Optional[str] = None,
+    status: Optional[str] = None,
+    error_category: Optional[str] = None,
+    image_available: Optional[bool] = None,
+    supports_vision: Optional[bool] = None,
+    image_sent: Optional[bool] = None,
+    image_mime: Optional[str] = None,
+    elapsed: Optional[float] = None,
+    note: Optional[str] = None,
+) -> None:
+    """Append a small sanitized event for in-app diagnostics and export."""
+    event = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "event_type": event_type,
+        "model": model_name,
+        "provider": provider,
+        "model_id": model_id,
+        "status": status,
+        "error_category": error_category,
+        "image_available": image_available,
+        "supports_vision": supports_vision,
+        "image_sent": image_sent,
+        "image_mime": image_mime,
+        "elapsed_seconds": round(float(elapsed), 3) if elapsed is not None else None,
+        "note": note,
+    }
+    # Remove None values to keep logs compact and avoid implying unavailable fields.
+    event = {k: v for k, v in event.items() if v is not None}
+    st.session_state.setdefault("debug_events", []).append(event)
+    st.session_state.debug_events = st.session_state.debug_events[-300:]
+
+
 def log_exception(context: str, exc: Exception) -> None:
     """Print detailed errors to Streamlit Cloud logs without exposing them in the UI."""
     print(f"[{datetime.now().isoformat()}] {context}: {exc}")
     print(traceback.format_exc())
+    try:
+        add_debug_event("exception", status="failed", error_category=categorize_exception(exc), note=context)
+    except Exception:
+        pass
 
 
 def build_gemini_safety_settings(mode: str) -> Optional[Dict[str, str]]:
@@ -472,6 +539,7 @@ def add_assistant_message(agent: 'Agent', content: str, elapsed: float, in_tok: 
     """Append an assistant message with export-friendly metadata."""
     cost = calculate_cost(agent.name, in_tok, out_tok)
     msg_id = get_next_message_id()
+    diagnostics = getattr(agent, "last_diagnostics", {}) or {}
     st.session_state.messages.append({
         "id": msg_id,
         "role": "assistant",
@@ -492,6 +560,11 @@ def add_assistant_message(agent: 'Agent', content: str, elapsed: float, in_tok: 
         "is_judge": is_judge,
         "is_error": is_error_content(content),
         "batch_id": batch_id,
+        "image_available": bool(diagnostics.get("image_available", False)),
+        "supports_vision": bool(diagnostics.get("supports_vision", agent.supports_vision)),
+        "image_sent": bool(diagnostics.get("image_sent", False)),
+        "image_mime": diagnostics.get("image_mime"),
+        "error_category": diagnostics.get("error_category"),
     })
     st.session_state.session_cost += cost
     st.session_state.total_tokens += (in_tok + out_tok)
@@ -530,6 +603,7 @@ class Agent:
         self.supports_vision = config.get("supports_vision", False)
         self.gemini_safety_mode = gemini_safety_mode
         self.request_timeout = max(10, min(180, int(request_timeout)))
+        self.last_diagnostics: Dict[str, Any] = {}
         
         # Build system prompt
         base_prompt = custom_system_prompt or config["default_system_prompt"]
@@ -596,7 +670,22 @@ class Agent:
     ) -> Tuple[str, int, int, float]:
         """Generate streaming response. Returns (content, in_tokens, out_tokens, time)."""
         
+        image_available = bool(image_b64)
+        image_sent_plan = bool(image_b64 and self.supports_vision)
+        self.last_diagnostics = {
+            "image_available": image_available,
+            "supports_vision": bool(self.supports_vision),
+            "image_sent": image_sent_plan,
+            "image_mime": image_mime if image_available else None,
+        }
+
         if self.error:
+            self.last_diagnostics.update({"image_sent": False, "error_category": "missing_api_key"})
+            add_debug_event(
+                "model_call", model_name=self.name, provider=self.provider, model_id=self.model_id,
+                status="failed", error_category="missing_api_key", image_available=image_available,
+                supports_vision=self.supports_vision, image_sent=False, image_mime=image_mime if image_available else None
+            )
             return f"⚠️ {self.error}", 0, 0, 0.0
 
         start_time = time.time()
@@ -612,11 +701,29 @@ class Agent:
                 )
             
             elapsed = time.time() - start_time
-            return self._clean_response(content), in_tok, out_tok, elapsed
+            cleaned = self._clean_response(content)
+            status = "failed" if is_error_content(cleaned) else "ok"
+            self.last_diagnostics["error_category"] = self.last_diagnostics.get("error_category")
+            add_debug_event(
+                "model_call", model_name=self.name, provider=self.provider, model_id=self.model_id,
+                status=status, error_category=self.last_diagnostics.get("error_category"),
+                image_available=image_available, supports_vision=self.supports_vision,
+                image_sent=bool(self.last_diagnostics.get("image_sent", image_sent_plan)),
+                image_mime=image_mime if image_available else None, elapsed=elapsed
+            )
+            return cleaned, in_tok, out_tok, elapsed
             
         except Exception as e:
             elapsed = time.time() - start_time
+            category = categorize_exception(e)
+            self.last_diagnostics.update({"error_category": category})
             log_exception(f"Error in {self.name}", e)
+            add_debug_event(
+                "model_call", model_name=self.name, provider=self.provider, model_id=self.model_id,
+                status="failed", error_category=category, image_available=image_available,
+                supports_vision=self.supports_vision, image_sent=image_sent_plan,
+                image_mime=image_mime if image_available else None, elapsed=elapsed
+            )
             return get_safe_api_error(self.name), 0, 0, elapsed
 
     def _stream_openai_compatible(
@@ -637,6 +744,7 @@ class Agent:
             messages.append({"role": role, "content": content})
 
         # Add image to last user message if provided and supported
+        attached_image = False
         if image_b64 and self.supports_vision and messages:
             last_user_idx = None
             for i in range(len(messages) - 1, -1, -1):
@@ -650,9 +758,14 @@ class Agent:
                     {"type": "text", "text": text_content},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}
+                        "image_url": {
+                            "url": f"data:{image_mime};base64,{image_b64}",
+                            "detail": "auto"
+                        }
                     }
                 ]
+                attached_image = True
+        self.last_diagnostics["image_sent"] = attached_image
 
         try:
             client = get_openai_client(self.api_key, self.config.get("base_url"), self.request_timeout)
@@ -683,6 +796,8 @@ class Agent:
             
         except Exception as e:
             error_msg = str(e).lower()
+            category = categorize_exception(e)
+            self.last_diagnostics["error_category"] = category
             if "rate" in error_msg and "limit" in error_msg:
                 return "⚠️ Rate limit reached. Please wait and try again.", 0, 0
             elif "invalid" in error_msg and "key" in error_msg:
@@ -730,6 +845,7 @@ class Agent:
             google_history.append({"role": role, "parts": [content]})
 
         # Add image to last user message if provided
+        attached_image = False
         if image_b64 and self.supports_vision and google_history:
             for i in range(len(google_history) - 1, -1, -1):
                 if google_history[i]["role"] == "user":
@@ -739,7 +855,9 @@ class Agent:
                             "data": image_b64
                         }
                     })
+                    attached_image = True
                     break
+        self.last_diagnostics["image_sent"] = attached_image
 
         safety_settings = build_gemini_safety_settings(self.gemini_safety_mode)
         
@@ -792,6 +910,8 @@ class Agent:
             error_str = str(e).lower()
             
             # Handle rate limiting - try non-streaming fallback
+            category = categorize_exception(e)
+            self.last_diagnostics["error_category"] = category
             if "429" in str(e) or "quota" in error_str or "rate" in error_str:
                 return self._call_google_non_streaming(
                     google_history, safety_settings, placeholder, model
@@ -1147,6 +1267,20 @@ with st.sidebar:
                 status = "🟢 ready" if ready else f"🔴 missing {cfg['api_key_name']}"
                 st.caption(f"{cfg['icon']} **{model_name}** · {status} · {vision}")
                 st.caption(f"↳ `{cfg.get('api_id')}` · `{cfg.get('provider')}`")
+
+        with st.expander("🖼️ Vision routing", expanded=False):
+            image_ready = bool(st.session_state.get("uploaded_image_b64"))
+            st.caption(f"Uploaded image ready: {'yes' if image_ready else 'no'}")
+            if image_ready:
+                st.caption(f"MIME: `{st.session_state.get('uploaded_image_mime', 'image/jpeg')}`")
+            for model_name in selected_models:
+                cfg = all_models[model_name]
+                will_send = image_ready and bool(cfg.get("supports_vision"))
+                st.caption(
+                    f"{cfg['icon']} **{model_name}** · supports images: "
+                    f"{'yes' if cfg.get('supports_vision') else 'no'} · image will be sent: "
+                    f"{'yes' if will_send else 'no'} · `{cfg.get('api_id')}`"
+                )
     
     with st.expander("ℹ️ Get API Keys"):
         st.markdown("""
@@ -1169,6 +1303,24 @@ with st.sidebar:
             st.caption("No model calls yet.")
         else:
             st.dataframe(perf_df, use_container_width=True, hide_index=True)
+
+    with st.expander("🧯 Debug log", expanded=False):
+        debug_events = st.session_state.get("debug_events", [])
+        st.caption("Sanitized diagnostics only; raw API keys, prompts, images, and full provider payloads are not stored here.")
+        if not debug_events:
+            st.caption("No debug events yet.")
+        else:
+            st.dataframe(pd.DataFrame(debug_events[-75:]), use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Debug JSON",
+                data=json.dumps(debug_events, indent=2),
+                file_name=f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+            if st.button("Clear debug log", use_container_width=True):
+                st.session_state.debug_events = []
+                st.rerun()
     
     # Export
     st.divider()
@@ -1211,6 +1363,7 @@ with st.sidebar:
         st.session_state.total_tokens = 0
         st.session_state.response_batches = []
         st.session_state.last_batch_id = 0
+        st.session_state.debug_events = []
         st.session_state.uploaded_image = None
         st.session_state.uploaded_image_b64 = None
         st.session_state.uploaded_image_mime = None
@@ -1325,6 +1478,9 @@ for i, message in enumerate(st.session_state.messages):
                     st.caption(f"🔢 {message.get('input_tokens', 0):,}/{message.get('output_tokens', 0):,}")
                 if message.get("estimated_cost") is not None:
                     st.caption(f"💵 ${message.get('estimated_cost', 0.0):.5f}")
+                if message.get("image_available") is not None:
+                    img_status = "sent" if message.get("image_sent") else ("not sent" if message.get("image_available") else "none")
+                    st.caption(f"🖼️ {img_status}")
                 if message.get("is_debate"):
                     st.caption("🔄 Debate")
                 if message.get("is_judge"):
@@ -1409,12 +1565,18 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                     )
                     
                     msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok, batch_id=batch_id)
+                    diag = getattr(agent, "last_diagnostics", {}) or {}
                     initial_response_records.append({
                         "name": agent.name, "content": content, "model_id": agent.model_id,
                         "provider": agent.provider, "response_time": elapsed,
                         "input_tokens": in_tok, "output_tokens": out_tok,
                         "estimated_cost": calculate_cost(agent.name, in_tok, out_tok),
-                        "is_error": is_error_content(content)
+                        "is_error": is_error_content(content),
+                        "image_available": bool(diag.get("image_available", False)),
+                        "supports_vision": bool(diag.get("supports_vision", agent.supports_vision)),
+                        "image_sent": bool(diag.get("image_sent", False)),
+                        "image_mime": diag.get("image_mime"),
+                        "error_category": diag.get("error_category")
                     })
                     st.caption(f"⏱️ {elapsed:.1f}s")
     
@@ -1433,12 +1595,18 @@ if user_input := st.chat_input(placeholder_text, disabled=not active_agents):
                 )
                 
                 msg_id = add_assistant_message(agent, content, elapsed, in_tok, out_tok, batch_id=batch_id)
+                diag = getattr(agent, "last_diagnostics", {}) or {}
                 initial_response_records.append({
                     "name": agent.name, "content": content, "model_id": agent.model_id,
                     "provider": agent.provider, "response_time": elapsed,
                     "input_tokens": in_tok, "output_tokens": out_tok,
                     "estimated_cost": calculate_cost(agent.name, in_tok, out_tok),
-                    "is_error": is_error_content(content)
+                    "is_error": is_error_content(content),
+                    "image_available": bool(diag.get("image_available", False)),
+                    "supports_vision": bool(diag.get("supports_vision", agent.supports_vision)),
+                    "image_sent": bool(diag.get("image_sent", False)),
+                    "image_mime": diag.get("image_mime"),
+                    "error_category": diag.get("error_category")
                 })
                 
                 col_time, col_retry = st.columns([0.8, 0.2])
